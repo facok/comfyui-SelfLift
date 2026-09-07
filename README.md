@@ -2,74 +2,76 @@
 
 [中文说明](README_CN.md)
 
-Progressive-resolution sampling in ComfyUI, implementing **SelfLift-zero**
-(Artifact-Aware Consistency Lift) from
-[SelfLift: Accelerating Few-Step Diffusion via Self-Recovering Resolution Transition](https://arxiv.org/abs/2609.02036)
-for compatible rectified-flow image backbones, with an experimental **MiniMax H3**
-audio-video adaptation. The paper evaluates FLUX.2-Klein and Z-Image-Turbo; it does
-not evaluate MiniMax H3.
+Progressive-resolution sampling in ComfyUI. The image node implements **SelfLift-zero** (Artifact-Aware Consistency Lift) from [SelfLift: Accelerating Few-Step Diffusion via Self-Recovering Resolution Transition](https://arxiv.org/abs/2609.02036) for compatible rectified-flow image backbones. The MiniMax H3 node is an experimental audio-video adaptation; the paper does not evaluate MiniMax H3.
 
-Progressive-resolution inference runs the early denoising steps at low resolution and
-finishes at full resolution, cutting the spatial cost of most model evaluations.
-At the transition, the predicted clean endpoint (Eq. 3) is lifted two ways — direct
-latent upsampling (`z_lat`) and decode → pixel upscale → re-encode (`z_pix`) — and
-their disagreement becomes a localized artifact-risk map that corrects high-risk
-locations toward the VAE-reachable anchor (Eqs. 4–9), then the corrected estimate is
-re-noised at the transition sigma (Eq. 10) and the schedule resumes at full resolution.
+The H3 node exposes two distinct modes:
+
+- `upscaler_model=none` with `rho>0` uses the paper-style SelfLift-zero transition: nearest-neighbor direct lift plus a selective pixel-VAE anchor.
+- An installed H3 upscaler with `rho=0` uses a learned, latent-only lift. This is the practical default, but it is neither SelfLift-zero nor SelfLift-rich.
+
+Progressive-resolution inference runs the early denoising steps at low resolution and finishes at full resolution, cutting the spatial cost of most model evaluations. At the transition, the predicted clean endpoint (Eq. 3) is lifted two ways — direct latent upsampling (`z_lat`) and decode → pixel upscale → re-encode (`z_pix`) — and their disagreement becomes a localized artifact-risk map that corrects high-risk locations toward the VAE-reachable anchor (Eqs. 4–9), then the corrected estimate is re-noised at the transition sigma (Eq. 10) and the schedule resumes at full resolution.
+
+## Optional H3 upscaler
+
+Download the checkpoint from [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) and place it under `ComfyUI/models/latent_upscale_models/`, then restart ComfyUI. The H3 node selects the first detected filename containing `h3`; if none is found, the default is `none`.
 
 ## Nodes
 
-Both nodes use `sampler`/`sigmas` inputs like `SamplerCustom`. Connect the standard
-`euler` sampler from `KSamplerSelect` and the model's normal scheduler. Other samplers
-are rejected because splitting multistep, ancestral, or SDE solvers would reset solver
-history or alter their stochastic process.
+Both nodes use `sampler`/`sigmas` inputs like `SamplerCustom`. Connect the standard `euler` sampler from `KSamplerSelect` and the model's normal scheduler. Other samplers are rejected because splitting multistep, ancestral, or SDE solvers would reset solver history or alter their stochastic process.
 
-- **SelfLift Progressive Sampler (MiniMax H3)** (`sampling/minimax`): H3 AV latents
-  (e.g. from *Empty MiniMax H3 AV Latent*). The audio stream has no spatial
-  dimensions and continues the reused Euler boundary step without spatial lifting;
-  keyframe condition latents are rescaled to the low-res grid for the prefix. This is
-  an engineering extension, not a configuration validated by the paper.
-- **SelfLift Progressive Sampler (Image)** (`sampling`): 4D image latents
-  (e.g. *Empty Latent Image*).
+- **SelfLift Progressive Sampler (MiniMax H3)** (`sampling/minimax`): H3 AV latents (e.g. from *Empty MiniMax H3 AV Latent*). The audio stream has no spatial dimensions and continues the reused Euler boundary step without spatial lifting; keyframe condition latents are rescaled to the low-res grid for the prefix. This is an engineering extension, not a configuration validated by the paper.
+- **SelfLift Progressive Sampler (Image)** (`sampling`): 4D image latents (e.g. *Empty Latent Image*).
 
-Parameters:
+### Parameters
 
-- `transition_step` (`t_r`): number of denoiser evaluations executed at low
-  resolution. The paper uses 3 of 4 and 6 of 8 NFEs on FLUX.2-Klein /
-  Z-Image-Turbo.
+- `transition_step`: number of denoiser evaluations executed at low resolution. This selects the paper's transition boundary `t_r`; it is a step count, not the literal continuous-time value. Valid values are `1` through `N-1` for an `N`-step schedule. Use `3` for the paper's 4-step FLUX.2-Klein setting and `6` for its 8-step Z-Image-Turbo setting.
 - `lowres_scale`: spatial scale of the prefix (paper: 0.5 = ¼ tokens).
-- `rho`, `w_min`, `w_max`: correction blend (paper: 0.3–0.4 / 0.5 / 1.0).
-  `rho=0` = plain direct lift; `rho=w=1.0` = pure pixel anchor. H3 defaults to
-  the paper's 8-NFE correction parameters (`0.3 / 0.5 / 1.0`), not a global anchor.
-- `latent_upsample`: interpolation of the direct lift (paper: nearest).
-- `upscaler_model` (H3 node only): a learned 3D-conv latent upscaler
-  (e.g. [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler),
-  placed under `models/latent_upscale_models/`). This optional external model is an
-  H3-specific experiment and is not the paper's SelfLift-rich lifter. The default
-  `none` uses nearest-neighbor lifting as specified by SelfLift-zero.
+- `rho`: fraction of the highest-risk locations corrected toward the pixel-VAE anchor. `rho=0` skips the pixel route and all artifact-aware correction.
+- `w_min`, `w_max`: correction range inside the selected mask. Values must satisfy `0 <= w_min <= w_max <= 1`. The paper uses `0.5 / 1.0`; `rho=1` with `w_min=w_max=1` is the pure pixel anchor.
+- `latent_upsample` (image node only): direct-lift interpolation. The paper uses `nearest`; `bilinear` is an optional experiment.
+- `upscaler_model` (H3 node only): learned 3D-conv direct lifter. `none` uses nearest-neighbor lifting. Using an external model with `rho>0` is a hybrid experiment, not paper-defined SelfLift-zero.
+- `seed`, `cfg`, `sampler`, and `sigmas` follow `SamplerCustom` semantics. Only standard Euler with `s_churn=0` is accepted.
 
-The transition does not add a denoiser evaluation. The final low-resolution Euler
-evaluation supplies Eq. 3; after lifting and re-noising, its prediction also completes
-that Euler interval. A schedule with `N` steps therefore remains exactly `N` NFEs:
-`transition_step` at low resolution and the rest at target resolution. SelfLift-zero
-adds one VAE decode → resize → encode round trip unless `rho=0` skips the pixel route.
+| Node | `transition_step` | `lowres_scale` | `rho` | `w_min / w_max` | Direct lift |
+| --- | ---: | ---: | ---: | ---: | --- |
+| MiniMax H3 | 6 | 0.5 | 0 | `0.5 / 1.0` | First installed H3 upscaler, otherwise nearest |
+| Image | 6 | 0.5 | 0.3 | `0.5 / 1.0` | Nearest |
+
+The image defaults match the paper's 8-step Z-Image-Turbo setup. For the 4-step FLUX.2-Klein setup, change `transition_step` to `3` and `rho` to `0.4`.
+
+The transition does not add a denoiser evaluation. The final low-resolution Euler evaluation supplies Eq. 3; after lifting and re-noising, its prediction also completes that Euler interval. A schedule with `N` steps therefore remains exactly `N` NFEs: `transition_step` at low resolution and the rest at target resolution. SelfLift-zero adds one VAE decode → resize → encode round trip unless `rho=0` skips the pixel route. With an H3 checkpoint installed, the H3 defaults take the latent-only external path. Select `upscaler_model=none` and set `rho>0` to run SelfLift-zero.
 
 ## Applicability
 
-Use the VAE belonging to the sampled model so the pixel anchor remains in the same
-latent space. The paper requires the backbone to support both selected resolutions.
-Its preliminary Wan2.1 video experiment found that unsupported token sequence lengths
-destabilized structure, so H3 resolutions, temporal behavior, and quality must be
-validated independently. Previous H3/Krea2 measurements from the probe-based
-implementation are intentionally not retained because they do not describe this
-corrected NFE-equivalent path.
+Use the VAE belonging to the sampled model so the pixel anchor remains in the same latent space. The paper requires the backbone to support both selected resolutions. Its preliminary Wan2.1 video experiment found that unsupported token sequence lengths destabilized structure, so H3 resolutions, temporal behavior, and quality must be validated independently. H3's standard 768-pixel short edge becomes 384 pixels at `lowres_scale=0.5`, which may be outside the backbone's training distribution even when the transition itself is correct. Results from the older probe-based implementation are invalid for the current NFE-equivalent path.
+
+### Diagnosing H3
+
+Use the same prompt and seed with `transition_step=6` and `lowres_scale=0.5`:
+
+| Test | `upscaler_model` | `rho` | weights | Meaning |
+| --- | --- | ---: | --- | --- |
+| Direct route | `none` | 0 | any | Nearest-neighbor latent lift only |
+| Pixel route | `none` | 1 | `1 / 1` | Pure H3 VAE pixel anchor |
+| Paper-like SelfLift-zero | `none` | 0.3 | `0.5 / 1` | Paper's image parameters with an experimental video risk map |
+| Strong H3 SelfLift-zero | `none` | 0.6 | `1 / 1` | Tested H3 starting point; reduce only if overly smooth |
+| External lifter | H3 checkpoint | 0 | any | Learned H3 lift, not SelfLift-zero |
+
+If the pure pixel route is clean but partial correction is not, H3 needs a different spatiotemporal risk/mask rule or different correction parameters. If the pure pixel route is also corrupted, the H3 transition endpoint/VAE round trip does not provide the stable complementary anchor required by SelfLift-zero. If only the external lifter is clean, the practical H3 path is progressive sampling with that learned lifter; it should not be described as SelfLift-zero.
+
+A post-fix controlled H3 run (one reference prompt/seed, 5 seconds, 8-step simple Euler) found a clean native baseline and a clean pure pixel anchor. The nearest route produced widespread outline/oil-paint artifacts; the paper's image setting (`rho=0.3`, `w_min=0.5`) left most of them visible. Raising `rho` to 0.6 improved the result, while `rho=0.6` with `w_min=w_max=1` and `rho=1` with `w_min=0.5,w_max=1` removed the main artifacts. This single-seed result does not establish general H3 compatibility or universal parameters. It does show that SelfLift-zero can operate on H3 in at least this configuration: in this run, the H3 direct-lift error was broader than on the paper's image backbones, so their sparse correction parameters did not transfer. For an H3 SelfLift-zero trial, start with `upscaler_model=none`, `rho=0.6`, and `w_min=w_max=1`, then reduce the correction only if the result is overly smooth. The external learned lifter remains the practical default and is not SelfLift-zero.
 
 ## Not included
 
-SelfLift-rich (the distilled latent lifter + On-Policy Self Recovery) requires
-training and is outside this plugin.
+SelfLift-rich (the distilled latent lifter + On-Policy Self Recovery) requires training and is outside this plugin.
 
-## Reference
+## References and acknowledgements
+
+- SelfLift paper: [SelfLift: Accelerating Few-Step Diffusion via Self-Recovering Resolution Transition](https://arxiv.org/abs/2609.02036)
+- Optional MiniMax H3 latent upscaler checkpoint and download: [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
+- Original ComfyUI integration and inference implementation: [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler)
+
+Thanks to LBH-123-AI for publishing the MiniMax H3 latent upscaler weights and ComfyUI implementation. They made the optional learned H3 lifting path in this plugin possible. This external lifter remains separate from the SelfLift paper's SelfLift-rich model.
 
 ```
 @article{wen2026selflift,

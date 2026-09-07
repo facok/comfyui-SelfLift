@@ -12,6 +12,7 @@ Two front-ends share the same engine:
 - SelfLiftImageSampler: compatible rectified-flow image models.
 """
 
+import logging
 import os
 
 import torch
@@ -31,8 +32,10 @@ from . import h3_upscaler
 
 def _upscaler_input():
     models = ["none"] + h3_upscaler.list_upscaler_models()
-    return (models, {"default": "none",
-                     "tooltip": "Optional experimental H3 latent upscaler (models/latent_upscale_models). 'none' uses the paper's nearest-neighbor direct lift."})
+    h3_models = [name for name in models[1:] if "h3" in name.lower()]
+    default = h3_models[0] if h3_models else "none"
+    return (models, {"default": default,
+                     "tooltip": "External H3 latent upscaler (models/latent_upscale_models). The first detected H3 model is selected by default; 'none' uses nearest-neighbor lifting."})
 
 
 def _streams(samples):
@@ -106,6 +109,10 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
         return latent_image
     if not 1 <= transition_step <= sigmas.shape[-1] - 2:
         raise ValueError(f"SelfLift: transition_step {transition_step} out of range for {sigmas.shape[-1] - 1} steps")
+    if not 0.0 <= rho <= 1.0:
+        raise ValueError("SelfLift: rho must be between 0 and 1")
+    if not 0.0 <= w_min <= w_max <= 1.0:
+        raise ValueError("SelfLift: weights must satisfy 0 <= w_min <= w_max <= 1")
 
     model_sampling = model.get_model_object("model_sampling")
     _validate_sampling(model_sampling, sampler)
@@ -157,11 +164,21 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     # Artifact-Aware Consistency Lift (Eqs. 4-9); skip branches the weights discard
     need_pix = rho > 0.0
     need_lat = not (rho >= 1.0 and w_min >= 1.0 and w_max >= 1.0)
+    latent_format = model.get_model_object("latent_format")
     z0_low = x0_streams[0].float()
-    z_lat, z_pix = selflift.paired_lifts(z0_low, vae, (H, W), latent_upsample, latent_lifter,
-                                         need_lat=need_lat, need_pix=need_pix)
+    z0_low_vae = latent_format.process_out(z0_low)
+    z_lat_vae, z_pix_vae = selflift.paired_lifts(
+        z0_low_vae, vae, (H, W), latent_upsample, latent_lifter,
+        need_lat=need_lat, need_pix=need_pix)
+    z_lat = latent_format.process_in(z_lat_vae) if z_lat_vae is not None else None
+    z_pix = latent_format.process_in(z_pix_vae) if z_pix_vae is not None else None
     x0_streams[0] = selflift.artifact_aware_consistency_lift(z_lat, z_pix, rho, w_min, w_max)
-    _debug_dump(vae, {"z0_low": z0_low, "z_lat": z_lat, "z_pix": z_pix, "z0_high": x0_streams[0]})
+    _debug_dump(vae, {
+        "z0_low": z0_low_vae,
+        "z_lat": z_lat_vae,
+        "z_pix": z_pix_vae,
+        "z0_high": latent_format.process_out(x0_streams[0]),
+    })
 
     # Re-noise the corrected video/image endpoint at the sigma of the reused model
     # evaluation, then complete that Euler interval without another denoiser call.
@@ -175,7 +192,7 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     next_streams = [_euler_step(state, denoised, sigma_k, sigma_next)
                     for state, denoised in zip(state_streams, x0_streams)]
     resume_streams = [model_sampling.inverse_noise_scaling(sigma_next, s) for s in next_streams]
-    resume_latent = _pack(resume_streams, nested)
+    resume_latent = model.model.process_latent_out(_pack(resume_streams, nested))
     resume_noise = _pack([torch.zeros_like(s) for s in resume_streams], nested)
 
     def callback_high(step, x0, x, total):
@@ -206,9 +223,9 @@ class SelfLiftH3Sampler:
             "cfg": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01}),
             "transition_step": ("INT", {"default": 6, "min": 1, "max": 10000, "tooltip": "Number of low-resolution denoiser evaluations. The paper uses 6 of 8 NFEs for its 8-step image model; H3 requires independent validation."}),
             "lowres_scale": ("FLOAT", {"default": 0.5, "min": 0.25, "max": 1.0, "step": 0.05, "tooltip": "Spatial scale of the low-resolution prefix (paper: 0.5)."}),
-            "rho": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Fraction of highest-risk spatiotemporal locations corrected toward the pixel-VAE anchor (paper's 8-step image setting: 0.3)."}),
-            "w_min": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
-            "w_max": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+            "rho": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Fraction of highest-risk spatiotemporal locations corrected toward the pixel-VAE anchor. The H3 default 0 uses only the external latent upscaler and skips the VAE round trip. For SelfLift-zero with upscaler_model=none, start near 0.6."}),
+            "w_min": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Correction-strength floor. H3's widespread nearest-lift error can require 1.0; 0.5 is the paper's image-model setting."}),
+            "w_max": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Correction-strength ceiling. Keep at 1.0 for the H3 SelfLift-zero diagnostic."}),
             "upscaler_model": _upscaler_input(),
         }}
 
@@ -220,6 +237,8 @@ class SelfLiftH3Sampler:
                transition_step, lowres_scale, rho, w_min, w_max, upscaler_model):
         lifter = None
         if upscaler_model != "none":
+            if rho > 0.0:
+                logging.warning("SelfLift H3: rho > 0 with an external upscaler is a hybrid experiment; select upscaler_model=none to test the paper's SelfLift-zero direct route")
             lifter = lambda z, hw: h3_upscaler.learned_latent_lift(z, hw, upscaler_model)
         return (progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
                                    transition_step, lowres_scale, rho, w_min, w_max, "nearest",
