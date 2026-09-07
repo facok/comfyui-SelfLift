@@ -41,6 +41,14 @@ The image defaults match the paper's 8-step Z-Image-Turbo setup. For the 4-step 
 
 The transition does not add a denoiser evaluation. The final low-resolution Euler evaluation supplies Eq. 3; after lifting and re-noising, its prediction also completes that Euler interval. A schedule with `N` steps therefore remains exactly `N` NFEs: `transition_step` at low resolution and the rest at target resolution. SelfLift-zero adds one VAE decode → resize → encode round trip unless `rho=0` skips the pixel route. With an H3 checkpoint installed, the H3 defaults take the latent-only external path. Select `upscaler_model=none` and set `rho>0` to run SelfLift-zero.
 
+## Timing and transition memory
+
+Both nodes log `[SelfLift timing]` messages for low-resolution sampling, the transition (endpoint preparation, paired lifts, correction/debug output, and re-noising), and high-resolution sampling. Sampling logs include each step and the stage total. The first step includes sampler/model preparation; callback intervals include previews and the preceding Euler update. The stage total also includes final updates, cleanup, and, for the high-resolution stage, output transfer. These are wall-clock measurements, not isolated GPU kernel timings.
+
+Timing does not force CUDA synchronization by default. For synchronized diagnostic measurements, set `SELFLIFT_TIMING_SYNC=1` before starting ComfyUI. This synchronizes the model's CUDA device at timing boundaries and can reduce execution overlap; leave it unset for normal use. CPU execution never invokes CUDA synchronization.
+
+The transition finishes the audio boundary update early and releases obsolete low-resolution states before lifting. Decoded pixel-anchor frames are released before VAE encoding. Model residency remains controlled by ComfyUI; these changes release ordinary tensors without forcing model unloads or clearing the CUDA cache.
+
 ## Applicability
 
 Use the VAE belonging to the sampled model so the pixel anchor remains in the same latent space. The paper requires the backbone to support both selected resolutions. Its preliminary Wan2.1 video experiment found that unsupported token sequence lengths destabilized structure, so H3 resolutions, temporal behavior, and quality must be validated independently. H3's standard 768-pixel short edge becomes 384 pixels at `lowres_scale=0.5`, which may be outside the backbone's training distribution even when the transition itself is correct. Results from the older probe-based implementation are invalid for the current NFE-equivalent path.

@@ -14,6 +14,7 @@ Two front-ends share the same engine:
 
 import logging
 import os
+import time
 
 import torch
 
@@ -28,6 +29,31 @@ import latent_preview
 
 from . import selflift
 from . import h3_upscaler
+
+
+class _StageTimer:
+    def __init__(self, stage, device):
+        self.stage = stage
+        self.device = torch.device(device)
+        self.synchronize = os.environ.get("SELFLIFT_TIMING_SYNC", "0") == "1" and self.device.type == "cuda"
+        self.started = self.previous = self._now()
+        logging.info("[SelfLift timing] %s start (%s)", stage,
+                     "CUDA-synchronized wall time" if self.synchronize else "wall time; no forced CUDA sync")
+
+    def _now(self):
+        if self.synchronize:
+            torch.cuda.synchronize(self.device)
+        return time.perf_counter()
+
+    def mark(self, label):
+        current = self._now()
+        logging.info("[SelfLift timing] %s %s: %.3fs", self.stage, label, current - self.previous)
+        self.previous = current
+
+    def finish(self):
+        current = self._now()
+        logging.info("[SelfLift timing] %s total: %.3fs; after last mark: %.3fs",
+                     self.stage, current - self.started, current - self.previous)
 
 
 def _upscaler_input():
@@ -133,6 +159,7 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     device = comfy.model_management.intermediate_device()
     low_latent = _pack([torch.zeros(low_shape, device=device)] +
                        [torch.zeros_like(s) for s in streams[1:]], nested)
+    del streams
     noise_low = comfy.sample.prepare_noise(low_latent, seed, latent_image.get("batch_index", None))
 
     total_steps = sigmas.shape[-1] - 1
@@ -150,65 +177,81 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
         if step == transition_step - 1:
             transition["state"] = x
             transition["x0"] = x0
-        return callback(step, x0, x, total_steps)
+        result = callback(step, x0, x, total_steps)
+        low_timer.mark(f"step {step + 1}/{transition_step}" + (" (includes setup)" if step == 0 else ""))
+        return result
 
     # The final low-resolution model evaluation is the Eq. 3 prediction. Its Euler
     # update is discarded and rebuilt after the resolution transition, preserving NFE.
+    low_timer = _StageTimer("low_resolution", model.load_device)
     comfy.samplers.sample(model, noise_low, positive_low, negative_low, cfg, model.load_device,
                           sampler, sigmas[:transition_step + 1], model.model_options,
                           latent_image=low_latent, callback=callback_low,
                           disable_pbar=disable_pbar, seed=seed)
-    low_streams, nested = _streams(transition["state"])
-    x0_streams, _ = _streams(transition["x0"])
+    low_timer.finish()
+    transition_timer = _StageTimer("transition", model.load_device)
+    low_streams, nested = _streams(transition.pop("state"))
+    x0_streams, _ = _streams(transition.pop("x0"))
+    sigma_k = sigmas[transition_step - 1]
+    sigma_next = sigmas[transition_step]
+    auxiliary_next = [_euler_step(state.to(device), denoised.to(device), sigma_k, sigma_next)
+                      for state, denoised in zip(low_streams[1:], x0_streams[1:])]
+    latent_format = model.get_model_object("latent_format")
+    z0_low_vae = latent_format.process_out(x0_streams[0].float()).to(device)
+    del low_latent, noise_low, low_streams, x0_streams, positive_low, negative_low
+    transition_timer.mark("prepare_endpoint")
 
     # Artifact-Aware Consistency Lift (Eqs. 4-9); skip branches the weights discard
     need_pix = rho > 0.0
     need_lat = not (rho >= 1.0 and w_min >= 1.0 and w_max >= 1.0)
-    latent_format = model.get_model_object("latent_format")
-    z0_low = x0_streams[0].float()
-    z0_low_vae = latent_format.process_out(z0_low)
     z_lat_vae, z_pix_vae = selflift.paired_lifts(
         z0_low_vae, vae, (H, W), latent_upsample, latent_lifter,
         need_lat=need_lat, need_pix=need_pix)
+    transition_timer.mark("paired_lifts")
     z_lat = latent_format.process_in(z_lat_vae) if z_lat_vae is not None else None
     z_pix = latent_format.process_in(z_pix_vae) if z_pix_vae is not None else None
-    x0_streams[0] = selflift.artifact_aware_consistency_lift(z_lat, z_pix, rho, w_min, w_max)
-    _debug_dump(vae, {
-        "z0_low": z0_low_vae,
-        "z_lat": z_lat_vae,
-        "z_pix": z_pix_vae,
-        "z0_high": latent_format.process_out(x0_streams[0]),
-    })
+    z0_high = selflift.artifact_aware_consistency_lift(z_lat, z_pix, rho, w_min, w_max)
+    if os.path.isdir(os.path.join(os.path.dirname(__file__), "debug")):
+        _debug_dump(vae, {
+            "z0_low": z0_low_vae,
+            "z_lat": z_lat_vae,
+            "z_pix": z_pix_vae,
+            "z0_high": latent_format.process_out(z0_high),
+        })
+    z0_high = z0_high.to(device)
+    del z0_low_vae, z_lat_vae, z_pix_vae, z_lat, z_pix
+    transition_timer.mark("correction_and_debug")
 
     # Re-noise the corrected video/image endpoint at the sigma of the reused model
     # evaluation, then complete that Euler interval without another denoiser call.
-    sigma_k = sigmas[transition_step - 1]
-    sigma_next = sigmas[transition_step]
-    x0_streams = [s.to(device) for s in x0_streams]
-    video_noise = comfy.sample.prepare_noise(x0_streams[0], (seed + 1) % (1 << 64),
-                                             latent_image.get("batch_index", None)).to(x0_streams[0])
-    state_streams = [model_sampling.noise_scaling(sigma_k, video_noise, x0_streams[0])]
-    state_streams.extend(s.to(device) for s in low_streams[1:])
-    next_streams = [_euler_step(state, denoised, sigma_k, sigma_next)
-                    for state, denoised in zip(state_streams, x0_streams)]
+    video_noise = comfy.sample.prepare_noise(z0_high, (seed + 1) % (1 << 64),
+                                             latent_image.get("batch_index", None)).to(z0_high)
+    video_state = model_sampling.noise_scaling(sigma_k, video_noise, z0_high)
+    next_streams = [_euler_step(video_state, z0_high, sigma_k, sigma_next)] + auxiliary_next
+    del z0_high, video_noise, video_state, auxiliary_next
     resume_streams = [model_sampling.inverse_noise_scaling(sigma_next, s) for s in next_streams]
     resume_latent = model.model.process_latent_out(_pack(resume_streams, nested))
     resume_noise = _pack([torch.zeros_like(s) for s in resume_streams], nested)
-    transition.clear()
-    del low_latent, noise_low, low_streams, x0_streams, z0_low, z0_low_vae
-    del z_lat_vae, z_pix_vae, z_lat, z_pix, video_noise, state_streams, next_streams, resume_streams
+    del next_streams, resume_streams
+    transition_timer.mark("renoise")
+    transition_timer.finish()
 
     def callback_high(step, x0, x, total):
-        return callback(step + transition_step, x0, x, total_steps)
+        result = callback(step + transition_step, x0, x, total_steps)
+        high_timer.mark(f"step {step + 1}/{total_steps - transition_step}" + (" (includes setup)" if step == 0 else ""))
+        return result
 
+    high_timer = _StageTimer("high_resolution", model.load_device)
     out = comfy.samplers.sample(model, resume_noise, positive, negative, cfg, model.load_device,
                                 sampler, sigmas[transition_step:], model.model_options,
                                 latent_image=resume_latent, callback=callback_high,
                                 disable_pbar=disable_pbar, seed=seed)
+    del resume_latent, resume_noise
 
     result = latent_image.copy()
     result["samples"] = out.to(device=comfy.model_management.intermediate_device(),
                                 dtype=comfy.model_management.intermediate_dtype())
+    high_timer.finish()
     return result
 
 

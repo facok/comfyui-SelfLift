@@ -37,6 +37,7 @@ def paired_lifts(z0_low, vae, out_hw, latent_mode="nearest", latent_lifter=None,
             img = vae.decode(z0_low)  # [B, h*ratio, w*ratio, 3]
             ratio = img.shape[1] // z0_low.shape[-2]
             up = comfy.utils.common_upscale(img.movedim(-1, 1), W * ratio, H * ratio, "lanczos", "disabled").movedim(1, -1)
+            del img
             z_pix = vae.encode(up).float()
             if z_lat is not None:
                 z_lat = z_lat.to(z_pix.device)
@@ -94,6 +95,7 @@ def _pixel_anchor_video_single(z0_low, vae, out_hw):
         chunk = torch.nn.functional.interpolate(chunk, size=(Hp, Wp), mode="bicubic", antialias=True)
         up[i:i + 32] = chunk.movedim(1, -1).to(up.device)
         del chunk
+    del frames
     return vae.encode(up).float()  # the wrapper turns the frame batch back into the time dim
 
 
