@@ -8,6 +8,7 @@ lifter described by the paper. The checkpoint is expected under
 ComfyUI/models/latent_upscale_models/.
 """
 
+import logging
 import os
 
 import torch
@@ -19,6 +20,8 @@ import comfy.model_patcher
 import folder_paths
 
 from comfy.ldm.minimax.vae import LATENTS_MEAN, LATENTS_STD
+
+from .diagnostics import log_memory
 
 _FOLDER = "latent_upscale_models"
 
@@ -34,6 +37,12 @@ def _zero_module(module):
     for p in module.parameters():
         p.detach().zero_()
     return module
+
+
+def _temporal_windows(length, chunk, overlap):
+    for start in range(0, length, chunk):
+        end = min(length, start + chunk)
+        yield start, end, max(0, start - overlap), min(length, end + overlap)
 
 
 class AttnBlock3D(nn.Module):
@@ -140,6 +149,16 @@ class LatentResizer3D(nn.Module):
         self.norm_out = _normalization(channels)
         self.conv_out = nn.Conv3d(channels, in_channels, 3, padding=1)
 
+    def temporal_chunk_settings(self):
+        for block in self.in_blocks:
+            if isinstance(block, TemporalConv):
+                return 32, block.dwconv.weight.shape[2]
+        return 32, 0
+
+    def temporal_window_budget(self, length):
+        chunk, overlap = self.temporal_chunk_settings()
+        return length if length <= chunk else min(length + 2 * overlap, chunk + 4 * overlap)
+
     def forward(self, x, scale=None, target_size=None, enable_chunking=True):
         if target_size is not None:
             size = target_size
@@ -153,14 +172,7 @@ class LatentResizer3D(nn.Module):
 
         B, C, T, H, W = x.shape
 
-        tk = 0
-        for b in self.in_blocks:
-            if isinstance(b, TemporalConv):
-                tk = b.dwconv.weight.shape[2]
-                break
-
-        overlap = tk
-        chunk = 32
+        chunk, overlap = self.temporal_chunk_settings()
 
         if not enable_chunking or T <= chunk:
             return self._forward_seg(x, scale, size)
@@ -170,12 +182,7 @@ class LatentResizer3D(nn.Module):
         out_full = torch.zeros(B, C, T, size[-2], size[-1], device=x.device, dtype=x.dtype)
         weight_full = torch.zeros(1, 1, T, 1, 1, device=x.device, dtype=x.dtype)
 
-        start = 0
-        while start < T:
-            seg_start = start
-            seg_end = min(T, start + chunk)
-            out_start = max(0, seg_start - overlap)
-            out_end = min(T, seg_end + overlap)
+        for seg_start, seg_end, out_start, out_end in _temporal_windows(T, chunk, overlap):
             lo = out_start
             hi = out_end + 2 * overlap
 
@@ -199,7 +206,6 @@ class LatentResizer3D(nn.Module):
             out_full[:, :, out_start:out_end] += valid_out * weight.view(1, 1, n_valid, 1, 1)
             weight_full[:, :, out_start:out_end] += weight.view(1, 1, n_valid, 1, 1)
 
-            start += chunk
             del seg, seg_out, valid_out
 
         return out_full / weight_full.clamp(min=1e-8)
@@ -319,12 +325,7 @@ def _load_model(model_name, device):
 def _inference_memory_required(model, z0_low, out_hw):
     H, W = out_hw
     T = z0_low.shape[2]
-    overlap = 0
-    for block in model.in_blocks:
-        if isinstance(block, TemporalConv):
-            overlap = block.dwconv.weight.shape[2]
-            break
-    temporal_window = T if T <= 32 else min(T + 2 * overlap, 32 + 4 * overlap)
+    temporal_window = model.temporal_window_budget(T)
     feature_elements = z0_low.shape[0] * model.conv_in.out_channels * temporal_window * H * W
     return feature_elements * model.conv_in.weight.element_size() * 8
 
@@ -340,10 +341,27 @@ def learned_latent_lift(z0_low, out_hw, model_name, device=None):
     h, w = z0_low.shape[-2], z0_low.shape[-1]
     scale = (H / h + W / w) / 2.0
 
+    log_memory("upscaler before_load", device)
     patcher = _load_model(model_name, device)
     model = patcher.model
     memory_required = _inference_memory_required(model, z0_low, (H, W))
+    length = z0_low.shape[2]
+    chunk, overlap = model.temporal_chunk_settings()
+    identity = (H, W) == (h, w)
+    chunked = not identity and length > chunk
+    windows = list(_temporal_windows(length, chunk, overlap)) if chunked else []
+    actual_window = max(end - start + 2 * overlap for _, _, start, end in windows) if chunked else length
+    budget_window = model.temporal_window_budget(length)
+    logging.info("[SelfLift upscaler] model=%s dtype=%s input=%s target_hw=%s "
+                 "spatial_lift=(%.4f, %.4f) scale_embedding=%.4f mode=%s "
+                 "chunk=%d overlap=%d windows=%d max_input_window=%d budget_window=%d "
+                 "estimated_workspace=%.2f MiB",
+                 model_name, model.conv_in.weight.dtype, tuple(z0_low.shape), (H, W),
+                 H / h, W / w, scale - 1.0, "identity" if identity else "chunked" if chunked else "full",
+                 chunk, overlap if chunked else 0, len(windows) if chunked else int(not identity),
+                 actual_window if not identity else 0, budget_window, memory_required / 2**20)
     comfy.model_management.load_models_gpu([patcher], memory_required=memory_required)
+    log_memory("upscaler after_load", device)
     dtype = model.conv_in.weight.dtype
     mean = torch.tensor(LATENTS_MEAN, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
     std = torch.tensor(LATENTS_STD, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
@@ -353,4 +371,5 @@ def learned_latent_lift(z0_low, out_hw, model_name, device=None):
         x = (x - mean) / std
         out = model(x, scale=scale, target_size=(z0_low.shape[2], H, W))
         out = (out * std + mean).float().to(comfy.model_management.intermediate_device())
+    log_memory("upscaler end", device)
     return out

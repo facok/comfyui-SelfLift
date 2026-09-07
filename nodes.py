@@ -29,6 +29,7 @@ import latent_preview
 
 from . import selflift
 from . import h3_upscaler
+from .diagnostics import log_memory
 
 
 class _StageTimer:
@@ -189,6 +190,15 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     h = max(2, round(H * lowres_scale / 2) * 2)
     w = max(2, round(W * lowres_scale / 2) * 2)
     low_shape = (b, c, t, h, w) if video else (b, c, h, w)
+    logging.info("[SelfLift plan] low_latent=%s target_latent=%s spatial_lift=(%.4f, %.4f) "
+                 "low_nfe=%d high_nfe=%d sigma_prediction=%.8g sigma_resume=%.8g "
+                 "rho=%.4f weights=(%.4f, %.4f) direct_lift=%s pixel_anchor=%s cfg=%.4f",
+                 low_shape, tuple(streams[0].shape), H / h, W / w,
+                 transition_step, sigmas.numel() - 1 - transition_step,
+                 sigmas[transition_step - 1].item(), sigmas[transition_step].item(),
+                 rho, w_min, w_max,
+                 "skipped" if rho == 1.0 and w_min == 1.0 else "external" if latent_lifter is not None else latent_upsample,
+                 rho > 0.0 and w_max > 0.0, cfg)
 
     device = comfy.model_management.intermediate_device()
     low_latent = _pack([torch.zeros(low_shape, device=device)] +
@@ -218,11 +228,13 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     # The final low-resolution model evaluation is the Eq. 3 prediction. Its Euler
     # update is discarded and rebuilt after the resolution transition, preserving NFE.
     low_timer = _StageTimer("low_resolution", model.load_device)
+    log_memory("low_resolution start", model.load_device)
     comfy.samplers.sample(model, noise_low, positive_low, negative_low, cfg, model.load_device,
                           sampler, sigmas[:transition_step + 1], model.model_options,
                           latent_image=low_latent, callback=callback_low,
                           disable_pbar=disable_pbar, seed=seed)
     low_timer.finish()
+    log_memory("low_resolution end", model.load_device)
     transition_timer = _StageTimer("transition", model.load_device)
     low_streams, nested = _streams(transition.pop("state"))
     x0_streams, _ = _streams(transition.pop("x0"))
@@ -234,6 +246,7 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     z0_low_vae = latent_format.process_out(x0_streams[0].float()).to(device)
     del low_latent, noise_low, low_streams, x0_streams, positive_low, negative_low
     transition_timer.mark("prepare_endpoint")
+    log_memory("transition endpoint_ready", model.load_device)
 
     # Artifact-Aware Consistency Lift (Eqs. 4-9); skip branches the weights discard
     need_pix = rho > 0.0 and w_max > 0.0
@@ -242,6 +255,7 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
         z0_low_vae, vae, (H, W), latent_upsample, latent_lifter,
         need_lat=need_lat, need_pix=need_pix)
     transition_timer.mark("paired_lifts")
+    log_memory("transition lifts_ready", model.load_device)
     z_lat = latent_format.process_in(z_lat_vae) if z_lat_vae is not None else None
     z_pix = latent_format.process_in(z_pix_vae) if z_pix_vae is not None else None
     z0_high = selflift.artifact_aware_consistency_lift(z_lat, z_pix, rho, w_min, w_max)
@@ -255,6 +269,7 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     z0_high = z0_high.to(device)
     del z0_low_vae, z_lat_vae, z_pix_vae, z_lat, z_pix
     transition_timer.mark("correction_and_debug")
+    log_memory("transition correction_ready", model.load_device)
 
     # Re-noise the corrected video/image endpoint at the sigma of the reused model
     # evaluation, then complete that Euler interval without another denoiser call.
@@ -269,6 +284,7 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     del next_streams, resume_streams
     transition_timer.mark("renoise")
     transition_timer.finish()
+    log_memory("transition end / high_resolution start", model.load_device)
 
     def callback_high(step, x0, x, total):
         result = callback(step + transition_step, x0, x, total_steps)
@@ -286,6 +302,7 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     result["samples"] = out.to(device=comfy.model_management.intermediate_device(),
                                 dtype=comfy.model_management.intermediate_dtype())
     high_timer.finish()
+    log_memory("high_resolution end", model.load_device)
     return result
 
 
