@@ -185,8 +185,8 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     sigma_k = sigmas[transition_step - 1]
     sigma_next = sigmas[transition_step]
     x0_streams = [s.to(device) for s in x0_streams]
-    video_noise = comfy.sample.prepare_noise(torch.zeros_like(x0_streams[0]), seed + 1,
-                                             latent_image.get("batch_index", None))
+    video_noise = comfy.sample.prepare_noise(x0_streams[0], (seed + 1) % (1 << 64),
+                                             latent_image.get("batch_index", None)).to(x0_streams[0])
     state_streams = [model_sampling.noise_scaling(sigma_k, video_noise, x0_streams[0])]
     state_streams.extend(s.to(device) for s in low_streams[1:])
     next_streams = [_euler_step(state, denoised, sigma_k, sigma_next)
@@ -207,7 +207,8 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
                                 disable_pbar=disable_pbar, seed=seed)
 
     result = latent_image.copy()
-    result["samples"] = out
+    result["samples"] = out.to(device=comfy.model_management.intermediate_device(),
+                                dtype=comfy.model_management.intermediate_dtype())
     return result
 
 

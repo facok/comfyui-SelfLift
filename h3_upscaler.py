@@ -176,8 +176,8 @@ class LatentResizer3D(nn.Module):
             seg_end = min(T, start + chunk)
             out_start = max(0, seg_start - overlap)
             out_end = min(T, seg_end + overlap)
-            lo = max(0, out_start - overlap)
-            hi = min(T + 2 * overlap, out_end + overlap)
+            lo = out_start
+            hi = out_end + 2 * overlap
 
             seg = x_padded[:, :, lo:hi].contiguous()
             seg_size = (hi - lo, size[-2], size[-1])
@@ -301,7 +301,6 @@ def _load_model(model_name, device):
     sd = {k: v.to(torch.float16) if v.dtype == torch.float8_e4m3fn else v for k, v in sd.items()}
 
     cfg = _detect_arch(sd)
-    dtype = sd['conv_in.weight'].dtype
     with torch.device("meta"):
         model = LatentResizer3D(
             in_channels=cfg["in_channels"], in_blocks=cfg["in_blocks"], out_blocks=cfg["out_blocks"],

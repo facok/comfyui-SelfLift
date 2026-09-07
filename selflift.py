@@ -61,6 +61,16 @@ def paired_lifts(z0_low, vae, out_hw, latent_mode="nearest", latent_lifter=None,
 
 
 def _pixel_anchor_video(z0_low, vae, out_hw):
+    """Build pixel anchors independently for each video in the latent batch."""
+    if z0_low.shape[0] == 1:
+        return _pixel_anchor_video_single(z0_low, vae, out_hw)
+    return torch.cat([
+        _pixel_anchor_video_single(sample, vae, out_hw)
+        for sample in z0_low.split(1)
+    ], dim=0)
+
+
+def _pixel_anchor_video_single(z0_low, vae, out_hw):
     """Pixel-VAE anchor for video: decode low-res, upscale, re-encode (Eq. 5).
 
     The upscale runs in fp16 GPU frame chunks into a preallocated buffer: a naive
