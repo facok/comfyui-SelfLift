@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import comfy.model_management
+import comfy.model_patcher
 import folder_paths
 
 from comfy.ldm.minimax.vae import LATENTS_MEAN, LATENTS_STD
@@ -277,9 +279,9 @@ def _detect_arch(sd):
 
 
 def _load_model(model_name, device):
-    key = (model_name, device.type)
+    key = (model_name, str(device))
     if key in _model_cache:
-        return _model_cache[key].to(device)
+        return _model_cache[key]
 
     path = None
     for p in folder_paths.get_folder_paths(_FOLDER):
@@ -299,18 +301,33 @@ def _load_model(model_name, device):
     sd = {k: v.to(torch.float16) if v.dtype == torch.float8_e4m3fn else v for k, v in sd.items()}
 
     cfg = _detect_arch(sd)
-    model = LatentResizer3D(
-        in_channels=cfg["in_channels"], in_blocks=cfg["in_blocks"], out_blocks=cfg["out_blocks"],
-        channels=cfg["channels"], dropout=cfg["dropout"], attn=cfg["attn"],
-        temporal_every=cfg["temporal_every"], temporal_kernel=cfg["temporal_kernel"],
-    )
-    model.load_state_dict(sd, strict=True)
-    # keep the checkpoint's storage dtype: upcasting the bf16 net to fp32 doubles
-    # its memory and sends conv3d down a much slower path
     dtype = sd['conv_in.weight'].dtype
-    model = model.to(device=device, dtype=dtype).eval().requires_grad_(False)
-    _model_cache[key] = model
-    return model
+    with torch.device("meta"):
+        model = LatentResizer3D(
+            in_channels=cfg["in_channels"], in_blocks=cfg["in_blocks"], out_blocks=cfg["out_blocks"],
+            channels=cfg["channels"], dropout=cfg["dropout"], attn=cfg["attn"],
+            temporal_every=cfg["temporal_every"], temporal_kernel=cfg["temporal_kernel"],
+        )
+    model.load_state_dict(sd, strict=True, assign=True)
+    model = model.eval().requires_grad_(False)
+    patcher = comfy.model_patcher.CoreModelPatcher(
+        model, load_device=device,
+        offload_device=comfy.model_management.unet_offload_device())
+    _model_cache[key] = patcher
+    return patcher
+
+
+def _inference_memory_required(model, z0_low, out_hw):
+    H, W = out_hw
+    T = z0_low.shape[2]
+    overlap = 0
+    for block in model.in_blocks:
+        if isinstance(block, TemporalConv):
+            overlap = block.dwconv.weight.shape[2]
+            break
+    temporal_window = T if T <= 32 else min(T + 2 * overlap, 32 + 4 * overlap)
+    feature_elements = z0_low.shape[0] * model.conv_in.out_channels * temporal_window * H * W
+    return feature_elements * model.conv_in.weight.element_size() * 8
 
 
 def learned_latent_lift(z0_low, out_hw, model_name, device=None):
@@ -320,11 +337,14 @@ def learned_latent_lift(z0_low, out_hw, model_name, device=None):
     """
     H, W = out_hw
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = comfy.model_management.get_torch_device()
     h, w = z0_low.shape[-2], z0_low.shape[-1]
     scale = (H / h + W / w) / 2.0
 
-    model = _load_model(model_name, device)
+    patcher = _load_model(model_name, device)
+    model = patcher.model
+    memory_required = _inference_memory_required(model, z0_low, (H, W))
+    comfy.model_management.load_models_gpu([patcher], memory_required=memory_required)
     dtype = model.conv_in.weight.dtype
     mean = torch.tensor(LATENTS_MEAN, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
     std = torch.tensor(LATENTS_STD, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
@@ -333,5 +353,5 @@ def learned_latent_lift(z0_low, out_hw, model_name, device=None):
     with torch.no_grad():
         x = (x - mean) / std
         out = model(x, scale=scale, target_size=(z0_low.shape[2], H, W))
-        out = out * std + mean
-    return out.float()
+        out = (out * std + mean).float().to(comfy.model_management.intermediate_device())
+    return out

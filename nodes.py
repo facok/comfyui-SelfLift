@@ -194,6 +194,9 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     resume_streams = [model_sampling.inverse_noise_scaling(sigma_next, s) for s in next_streams]
     resume_latent = model.model.process_latent_out(_pack(resume_streams, nested))
     resume_noise = _pack([torch.zeros_like(s) for s in resume_streams], nested)
+    transition.clear()
+    del low_latent, noise_low, low_streams, x0_streams, z0_low, z0_low_vae
+    del z_lat_vae, z_pix_vae, z_lat, z_pix, video_noise, state_streams, next_streams, resume_streams
 
     def callback_high(step, x0, x, total):
         return callback(step + transition_step, x0, x, total_steps)
