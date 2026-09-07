@@ -85,6 +85,36 @@ def _validate_sampling(model_sampling, sampler):
         raise ValueError("SelfLift requires Euler with s_churn=0")
 
 
+def _validate_schedule(sigmas, transition_step):
+    if sigmas.ndim != 1 or not sigmas.is_floating_point():
+        raise ValueError("SelfLift: sigmas must be a one-dimensional floating-point tensor")
+    if not torch.isfinite(sigmas).all() or (sigmas < 0).any():
+        raise ValueError("SelfLift: sigmas must be finite and nonnegative")
+    if sigmas.numel() < 2:
+        return
+    if not isinstance(transition_step, int) or not 1 <= transition_step <= sigmas.numel() - 2:
+        raise ValueError(f"SelfLift: transition_step {transition_step} out of range for {sigmas.numel() - 1} steps")
+    if (sigmas[1:] > sigmas[:-1]).any():
+        raise ValueError("SelfLift: sigmas must be non-increasing")
+    if (sigmas[:-1] <= 0).any():
+        raise ValueError("SelfLift: only the final sigma may be zero")
+    if sigmas[transition_step] >= 1:
+        raise ValueError("SelfLift: the high-resolution starting sigma must be less than 1")
+
+
+def _validate_latent_input(latent_image):
+    if latent_image.get("noise_mask") is not None:
+        raise ValueError("SelfLift: noise_mask/inpainting is not supported; use an empty latent without a mask")
+    streams, _ = _streams(latent_image["samples"])
+    if not streams or streams[0].ndim not in (4, 5):
+        raise ValueError("SelfLift: expected a 4D image or 5D video latent size template")
+    for stream in streams:
+        if stream.ndim == 0 or any(size == 0 for size in stream.shape) or stream.shape[0] != streams[0].shape[0]:
+            raise ValueError("SelfLift: latent streams must be nonempty and have the same batch size")
+        if torch.count_nonzero(stream) != 0:
+            raise ValueError("SelfLift: latent_image must be an all-zero size template; encoded/init latents are not supported")
+
+
 def _euler_step(state, denoised, sigma, sigma_next):
     step = ((sigma_next - sigma) / sigma).to(device=state.device, dtype=state.dtype)
     return state + (state - denoised.to(state)) * step
@@ -114,10 +144,12 @@ def _resize_keyframes(cond, h, w):
 
 
 def _debug_dump(vae, latents):
-    """Decode transition intermediates to PNGs; enabled by creating a debug/ dir next to this file."""
-    out_dir = os.path.join(os.path.dirname(__file__), "debug")
-    if not os.path.isdir(out_dir):
+    """Decode transition intermediates to PNGs when SELFLIFT_DEBUG=1."""
+    if os.environ.get("SELFLIFT_DEBUG", "0") != "1":
         return
+    out_dir = os.path.join(os.path.dirname(__file__), "debug")
+    os.makedirs(out_dir, exist_ok=True)
+    logging.warning("SelfLift: debug decoding enabled; intermediate video decodes can substantially increase time and memory")
     from PIL import Image
     for name, lat in latents.items():
         if lat is None:
@@ -131,14 +163,16 @@ def _debug_dump(vae, latents):
 
 def progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
                        transition_step, lowres_scale, rho, w_min, w_max, latent_upsample, latent_lifter=None):
-    if sigmas.shape[-1] < 2:
+    _validate_schedule(sigmas, transition_step)
+    if sigmas.numel() < 2:
         return latent_image
-    if not 1 <= transition_step <= sigmas.shape[-1] - 2:
-        raise ValueError(f"SelfLift: transition_step {transition_step} out of range for {sigmas.shape[-1] - 1} steps")
+    if not 0.25 <= lowres_scale <= 1.0:
+        raise ValueError("SelfLift: lowres_scale must be between 0.25 and 1")
     if not 0.0 <= rho <= 1.0:
         raise ValueError("SelfLift: rho must be between 0 and 1")
     if not 0.0 <= w_min <= w_max <= 1.0:
         raise ValueError("SelfLift: weights must satisfy 0 <= w_min <= w_max <= 1")
+    _validate_latent_input(latent_image)
 
     model_sampling = model.get_model_object("model_sampling")
     _validate_sampling(model_sampling, sampler)
@@ -202,7 +236,7 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     transition_timer.mark("prepare_endpoint")
 
     # Artifact-Aware Consistency Lift (Eqs. 4-9); skip branches the weights discard
-    need_pix = rho > 0.0
+    need_pix = rho > 0.0 and w_max > 0.0
     need_lat = not (rho >= 1.0 and w_min >= 1.0 and w_max >= 1.0)
     z_lat_vae, z_pix_vae = selflift.paired_lifts(
         z0_low_vae, vae, (H, W), latent_upsample, latent_lifter,
@@ -211,7 +245,7 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     z_lat = latent_format.process_in(z_lat_vae) if z_lat_vae is not None else None
     z_pix = latent_format.process_in(z_pix_vae) if z_pix_vae is not None else None
     z0_high = selflift.artifact_aware_consistency_lift(z_lat, z_pix, rho, w_min, w_max)
-    if os.path.isdir(os.path.join(os.path.dirname(__file__), "debug")):
+    if os.environ.get("SELFLIFT_DEBUG", "0") == "1":
         _debug_dump(vae, {
             "z0_low": z0_low_vae,
             "z_lat": z_lat_vae,
@@ -263,7 +297,7 @@ class SelfLiftH3Sampler:
             "positive": ("CONDITIONING",),
             "negative": ("CONDITIONING",),
             "vae": ("VAE", {"tooltip": "Video VAE used for the pixel re-encode anchor at the resolution transition."}),
-            "latent_image": ("LATENT", {"tooltip": "Target-resolution latent (e.g. Empty MiniMax H3 AV Latent), defines the output size and duration."}),
+            "latent_image": ("LATENT", {"tooltip": "All-zero target-resolution latent (e.g. Empty MiniMax H3 AV Latent), defines size and duration. Encoded/init latents and noise masks are not supported; supply keyframes through conditioning."}),
             "sampler": ("SAMPLER", {"tooltip": "Standard Euler only; SelfLift reuses its transition-step prediction to keep the original NFE count."}),
             "sigmas": ("SIGMAS",),
             "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
@@ -284,7 +318,7 @@ class SelfLiftH3Sampler:
                transition_step, lowres_scale, rho, w_min, w_max, upscaler_model):
         lifter = None
         if upscaler_model != "none":
-            if rho > 0.0:
+            if rho > 0.0 and w_max > 0.0:
                 logging.warning("SelfLift H3: rho > 0 with an external upscaler is a hybrid experiment; select upscaler_model=none to test the paper's SelfLift-zero direct route")
             lifter = lambda z, hw: h3_upscaler.learned_latent_lift(z, hw, upscaler_model)
         return (progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
@@ -302,7 +336,7 @@ class SelfLiftImageSampler:
             "positive": ("CONDITIONING",),
             "negative": ("CONDITIONING",),
             "vae": ("VAE", {"tooltip": "VAE used for the pixel re-encode anchor at the resolution transition."}),
-            "latent_image": ("LATENT", {"tooltip": "Target-resolution latent (e.g. Empty Latent Image), defines the output size."}),
+            "latent_image": ("LATENT", {"tooltip": "All-zero target-resolution latent (e.g. Empty Latent Image), defines the output size. Encoded/init latents and noise masks are not supported."}),
             "sampler": ("SAMPLER", {"tooltip": "Standard Euler only; SelfLift reuses its transition-step prediction to keep the original NFE count."}),
             "sigmas": ("SIGMAS",),
             "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),

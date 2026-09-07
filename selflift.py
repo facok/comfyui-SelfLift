@@ -101,7 +101,7 @@ def _pixel_anchor_video_single(z0_low, vae, out_hw):
 
 def artifact_aware_consistency_lift(z_lat, z_pix, rho, w_min, w_max):
     """Selective correction of the direct lift toward the pixel-VAE anchor (Eqs. 6-9)."""
-    if rho <= 0.0:
+    if rho <= 0.0 or w_max <= 0.0:
         return z_lat
     if rho >= 1.0 and w_min >= 1.0 and w_max >= 1.0:
         return z_pix

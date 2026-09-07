@@ -27,7 +27,7 @@ H3 节点提供两种不同模式：
 - `transition_step`：在低分辨率执行的 denoiser evaluation 数量。它用于选择论文的过渡边界 `t_r`，但自身是步骤数，不是连续时间值。对于 `N` 步调度，有效范围是 `1` 到 `N-1`。论文的 4-step FLUX.2-Klein 使用 `3`，8-step Z-Image-Turbo 使用 `6`。
 - `lowres_scale`：前缀的空间缩放（论文：0.5 = ¼ token）。
 - `rho`：向 pixel-VAE 锚点修正的最高风险位置比例。`rho=0` 会跳过 pixel route 和全部 artifact-aware correction。
-- `w_min`、`w_max`：选中 mask 内的修正范围，必须满足 `0 <= w_min <= w_max <= 1`。论文使用 `0.5 / 1.0`；当 `rho=1` 且 `w_min=w_max=1` 时是纯像素锚点。
+- `w_min`、`w_max`：选中 mask 内的修正范围，必须满足 `0 <= w_min <= w_max <= 1`。论文使用 `0.5 / 1.0`；当 `rho=1` 且 `w_min=w_max=1` 时是纯像素锚点。两者均为零时，无论 `rho` 为何，都会跳过像素路径和修正。
 - `latent_upsample`（仅图像节点）：直接提升的插值方式。论文使用 `nearest`；`bilinear` 是可选实验。
 - `upscaler_model`（仅 H3 节点）：学习式 3D 卷积直接提升器。`none` 使用 nearest-neighbor。外部模型与 `rho>0` 同时使用属于混合实验，不是论文定义的 SelfLift-zero。
 - `seed`、`cfg`、`sampler` 和 `sigmas` 与 `SamplerCustom` 语义相同。只接受 `s_churn=0` 的标准 Euler。
@@ -39,7 +39,7 @@ H3 节点提供两种不同模式：
 
 图像节点默认值对应论文的 8-step Z-Image-Turbo 配置。使用 4-step FLUX.2-Klein 时，应把 `transition_step` 改为 `3`，并把 `rho` 改为 `0.4`。
 
-转换不会增加 denoiser evaluation。最后一次低分辨率 Euler 评估直接提供式 3 的预测；提升并重新加噪后，同一预测继续完成该 Euler 区间。包含 `N` 步的 schedule 因而仍严格保持 `N` NFE：其中 `transition_step` 次在低分辨率，其余在目标分辨率。除非 `rho=0` 跳过 pixel route，SelfLift-zero 还会增加一次 VAE 解码 → 缩放 → 编码往返。安装 H3 checkpoint 后，H3 默认走外部纯 latent 路径。要运行 SelfLift-zero，请选择 `upscaler_model=none` 并设置 `rho>0`。
+转换不会增加 denoiser evaluation。最后一次低分辨率 Euler 评估直接提供式 3 的预测；提升并重新加噪后，同一预测继续完成该 Euler 区间。包含 `N` 步的 schedule 因而仍严格保持 `N` NFE：其中 `transition_step` 次在低分辨率，其余在目标分辨率。除非 `rho=0` 或两个修正权重均为零，SelfLift-zero 还会增加一次 VAE 解码 → 缩放 → 编码往返。安装 H3 checkpoint 后，H3 默认走外部纯 latent 路径。要运行 SelfLift-zero，请选择 `upscaler_model=none`，设置 `rho>0` 并使用非零修正权重。
 
 ## 阶段计时与过渡内存
 
@@ -47,9 +47,15 @@ H3 节点提供两种不同模式：
 
 默认计时不强制同步 CUDA。需要同步诊断时，在启动 ComfyUI 前设置 `SELFLIFT_TIMING_SYNC=1`，即可在计时边界同步模型所在的 CUDA 设备；这可能减少执行重叠，正常使用时无需设置。CPU 执行不会调用 CUDA 同步。
 
+保存中间 PNG 需要在启动 ComfyUI 前设置 `SELFLIFT_DEBUG=1`。节点会自动创建 `debug/`；仅保留该目录不再触发调试解码。调试输出可能解码完整中间视频，但只保存首帧，即使 `rho=0` 也会显著增加时间和内存开销。正常使用时不要设置此选项。调试文件已加入 Git 忽略规则。
+
 过渡时提前完成音频边界更新，在提升前释放无用的低分辨率状态；像素锚点的解码帧会在 VAE 编码前释放。模型驻留仍由 ComfyUI 管理，这些改动只释放普通张量，不强制卸载模型或清空 CUDA 缓存。
 
 ## 适用范围
+
+`latent_image` 必须是全零的尺寸模板，包括音频流。编码后的初始 latent 和 `noise_mask` 会在采样前被拒绝；此输入不支持图生图或局部重绘。通过 conditioning 传入的 H3 关键帧和参考条件仍然受支持。
+
+`sigmas` 必须是一维浮点张量，各值有限、非负且单调不增。只有最后一个 sigma 可以为零，高分辨率起始 sigma（`sigmas[transition_step]`）必须小于 1。空调度或仅一个值的调度直接返回原输入；实际采样至少需要两步，`lowres_scale` 必须在 0.25 到 1 之间。非零末尾 sigma 保留采样器的部分去噪行为。`lowres_scale=1` 仍然执行过渡和重新加噪；全分辨率基线请使用原生采样器。
 
 必须使用采样模型所属的 VAE，保证像素锚点仍位于同一 latent 空间。论文要求 backbone 可靠支持所选的两种分辨率；其 Wan2.1 初步视频实验发现，不受支持的 token sequence 长度会破坏场景结构。因此 H3 的分辨率、时序行为和质量需要独立验证。H3 标准的 768 像素短边在 `lowres_scale=0.5` 时会变成 384 像素，即使过渡实现正确，也可能超出 backbone 的训练分布。旧 probe 实现的结果不适用于当前修复后的 NFE 等价路径。
 

@@ -27,7 +27,7 @@ Both nodes use `sampler`/`sigmas` inputs like `SamplerCustom`. Connect the stand
 - `transition_step`: number of denoiser evaluations executed at low resolution. This selects the paper's transition boundary `t_r`; it is a step count, not the literal continuous-time value. Valid values are `1` through `N-1` for an `N`-step schedule. Use `3` for the paper's 4-step FLUX.2-Klein setting and `6` for its 8-step Z-Image-Turbo setting.
 - `lowres_scale`: spatial scale of the prefix (paper: 0.5 = ¼ tokens).
 - `rho`: fraction of the highest-risk locations corrected toward the pixel-VAE anchor. `rho=0` skips the pixel route and all artifact-aware correction.
-- `w_min`, `w_max`: correction range inside the selected mask. Values must satisfy `0 <= w_min <= w_max <= 1`. The paper uses `0.5 / 1.0`; `rho=1` with `w_min=w_max=1` is the pure pixel anchor.
+- `w_min`, `w_max`: correction range inside the selected mask. Values must satisfy `0 <= w_min <= w_max <= 1`. The paper uses `0.5 / 1.0`; `rho=1` with `w_min=w_max=1` is the pure pixel anchor. Setting both weights to zero skips the pixel route and correction, regardless of `rho`.
 - `latent_upsample` (image node only): direct-lift interpolation. The paper uses `nearest`; `bilinear` is an optional experiment.
 - `upscaler_model` (H3 node only): learned 3D-conv direct lifter. `none` uses nearest-neighbor lifting. Using an external model with `rho>0` is a hybrid experiment, not paper-defined SelfLift-zero.
 - `seed`, `cfg`, `sampler`, and `sigmas` follow `SamplerCustom` semantics. Only standard Euler with `s_churn=0` is accepted.
@@ -39,7 +39,7 @@ Both nodes use `sampler`/`sigmas` inputs like `SamplerCustom`. Connect the stand
 
 The image defaults match the paper's 8-step Z-Image-Turbo setup. For the 4-step FLUX.2-Klein setup, change `transition_step` to `3` and `rho` to `0.4`.
 
-The transition does not add a denoiser evaluation. The final low-resolution Euler evaluation supplies Eq. 3; after lifting and re-noising, its prediction also completes that Euler interval. A schedule with `N` steps therefore remains exactly `N` NFEs: `transition_step` at low resolution and the rest at target resolution. SelfLift-zero adds one VAE decode → resize → encode round trip unless `rho=0` skips the pixel route. With an H3 checkpoint installed, the H3 defaults take the latent-only external path. Select `upscaler_model=none` and set `rho>0` to run SelfLift-zero.
+The transition does not add a denoiser evaluation. The final low-resolution Euler evaluation supplies Eq. 3; after lifting and re-noising, its prediction also completes that Euler interval. A schedule with `N` steps therefore remains exactly `N` NFEs: `transition_step` at low resolution and the rest at target resolution. SelfLift-zero adds one VAE decode → resize → encode round trip unless `rho=0` or both correction weights are zero. With an H3 checkpoint installed, the H3 defaults take the latent-only external path. Select `upscaler_model=none` and set `rho>0` with nonzero correction weights to run SelfLift-zero.
 
 ## Timing and transition memory
 
@@ -47,9 +47,15 @@ Both nodes log `[SelfLift timing]` messages for low-resolution sampling, the tra
 
 Timing does not force CUDA synchronization by default. For synchronized diagnostic measurements, set `SELFLIFT_TIMING_SYNC=1` before starting ComfyUI. This synchronizes the model's CUDA device at timing boundaries and can reduce execution overlap; leave it unset for normal use. CPU execution never invokes CUDA synchronization.
 
+Intermediate PNG dumps require `SELFLIFT_DEBUG=1` before starting ComfyUI. The node creates `debug/` automatically; an existing directory alone no longer enables decoding. Debug output can decode entire intermediate videos to save their first frames, substantially increasing time and memory even when `rho=0`. Leave this option unset for normal use. Debug files are ignored by Git.
+
 The transition finishes the audio boundary update early and releases obsolete low-resolution states before lifting. Decoded pixel-anchor frames are released before VAE encoding. Model residency remains controlled by ComfyUI; these changes release ordinary tensors without forcing model unloads or clearing the CUDA cache.
 
 ## Applicability
+
+`latent_image` must be an all-zero size template, including any audio streams. Encoded/init latents and `noise_mask` are rejected before sampling; img2img and inpainting through this input are not supported. H3 keyframes and references supplied through conditioning remain supported.
+
+`sigmas` must be a one-dimensional floating-point tensor with finite, nonnegative, non-increasing values. Only the final sigma may be zero, and the high-resolution starting sigma (`sigmas[transition_step]`) must be less than 1. Empty and single-value schedules return the input unchanged. Active schedules need at least two steps; `lowres_scale` must be between 0.25 and 1. A nonzero final sigma retains the sampler's partial-denoising behavior. `lowres_scale=1` still performs the transition and re-noising; use a native sampler for a full-resolution baseline.
 
 Use the VAE belonging to the sampled model so the pixel anchor remains in the same latent space. The paper requires the backbone to support both selected resolutions. Its preliminary Wan2.1 video experiment found that unsupported token sequence lengths destabilized structure, so H3 resolutions, temporal behavior, and quality must be validated independently. H3's standard 768-pixel short edge becomes 384 pixels at `lowres_scale=0.5`, which may be outside the backbone's training distribution even when the transition itself is correct. Results from the older probe-based implementation are invalid for the current NFE-equivalent path.
 
