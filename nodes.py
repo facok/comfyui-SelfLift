@@ -29,6 +29,7 @@ import latent_preview
 
 from . import selflift
 from . import h3_upscaler
+from . import h3_tiling
 from .diagnostics import log_memory
 
 
@@ -163,7 +164,8 @@ def _debug_dump(vae, latents):
 
 
 def progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
-                       transition_step, lowres_scale, rho, w_min, w_max, latent_upsample, latent_lifter=None):
+                       transition_step, lowres_scale, rho, w_min, w_max, latent_upsample, latent_lifter=None,
+                       highres_tiling=False):
     _validate_schedule(sigmas, transition_step)
     if sigmas.numel() < 2:
         return latent_image
@@ -181,6 +183,7 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     streams, nested = _streams(comfy.sample.fix_empty_latent_channels(
         model, latent_image["samples"], latent_image.get("downscale_ratio_spacial", None),
         latent_image.get("downscale_ratio_temporal", None)))
+    high_model = h3_tiling.tiled_model(model, [tuple(stream.shape) for stream in streams]) if highres_tiling else model
     video = streams[0].ndim == 5
     if video:
         b, c, t, H, W = streams[0].shape
@@ -307,8 +310,10 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
         return result
 
     high_timer = _StageTimer("high_resolution", model.load_device)
-    out = comfy.samplers.sample(model, resume_noise, positive, negative, cfg, model.load_device,
-                                sampler, sigmas[transition_step:], model.model_options,
+    if highres_tiling:
+        logging.info("[SelfLift plan] automatic high-resolution tiling enabled; preparation selects the tile count")
+    out = comfy.samplers.sample(high_model, resume_noise, positive, negative, cfg, model.load_device,
+                                sampler, sigmas[transition_step:], high_model.model_options,
                                 latent_image=resume_latent, callback=callback_high,
                                 disable_pbar=disable_pbar, seed=seed)
     del resume_latent, resume_noise
@@ -342,6 +347,8 @@ class SelfLiftH3Sampler:
             "w_min": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Correction-strength floor. H3's widespread nearest-lift error can require 1.0; 0.5 is the paper's image-model setting."}),
             "w_max": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Correction-strength ceiling. Keep at 1.0 for the H3 SelfLift-zero diagnostic."}),
             "upscaler_model": _upscaler_input(),
+        }, "optional": {
+            "highres_tiling": ("BOOLEAN", {"default": False, "label_on": "高分辨率分块：开启", "label_off": "高分辨率分块：关闭", "tooltip": "Experimental: select 1–8 spatial tiles from available memory at high-resolution preparation. Audio input and references remain complete; only the first tile's audio prediction is retained. Quality and speed may change."}),
         }}
 
     RETURN_TYPES = ("LATENT",)
@@ -349,7 +356,7 @@ class SelfLiftH3Sampler:
     CATEGORY = "sampling/minimax"
 
     def sample(self, model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
-               transition_step, lowres_scale, rho, w_min, w_max, upscaler_model):
+               transition_step, lowres_scale, rho, w_min, w_max, upscaler_model, highres_tiling=False):
         lifter = None
         if upscaler_model != "none":
             if rho > 0.0 and w_max > 0.0:
@@ -357,7 +364,7 @@ class SelfLiftH3Sampler:
             lifter = lambda z, hw: h3_upscaler.learned_latent_lift(z, hw, upscaler_model)
         return (progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
                                    transition_step, lowres_scale, rho, w_min, w_max, "nearest",
-                                   latent_lifter=lifter),)
+                                   latent_lifter=lifter, highres_tiling=highres_tiling),)
 
 
 class SelfLiftImageSampler:
