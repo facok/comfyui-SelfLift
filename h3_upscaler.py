@@ -284,6 +284,21 @@ def _detect_arch(sd):
     return cfg
 
 
+def _normalize_checkpoint_dtype(state_dict):
+    weight = state_dict.get("conv_in.weight")
+    if weight is None:
+        raise ValueError("SelfLift: upscaler checkpoint is missing conv_in.weight")
+    dtype = weight.dtype
+    if str(dtype).startswith("torch.float8_"):
+        dtype = torch.bfloat16 if any(value.dtype == torch.bfloat16 for value in state_dict.values()) else torch.float16
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        raise ValueError(f"SelfLift: unsupported upscaler weight dtype {dtype}")
+    if any(value.is_floating_point() and value.dtype != dtype for value in state_dict.values()):
+        logging.info("SelfLift: normalizing mixed upscaler floating-point tensors to %s", dtype)
+    return {name: value.to(dtype=dtype) if value.is_floating_point() else value
+            for name, value in state_dict.items()}
+
+
 def _load_model(model_name, device):
     key = (model_name, str(device))
     if key in _model_cache:
@@ -304,7 +319,7 @@ def _load_model(model_name, device):
         sd = sd['model']
     if any(k.startswith("upscaler.") for k in sd):
         sd = {k[len("upscaler."):]: v for k, v in sd.items() if k.startswith("upscaler.")}
-    sd = {k: v.to(torch.float16) if v.dtype == torch.float8_e4m3fn else v for k, v in sd.items()}
+    sd = _normalize_checkpoint_dtype(sd)
 
     cfg = _detect_arch(sd)
     with torch.device("meta"):

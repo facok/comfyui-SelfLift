@@ -13,6 +13,8 @@ Progressive-resolution inference runs the early denoising steps at low resolutio
 
 ## Optional H3 upscaler
 
+The loader aligns floating-point weights, biases and normalization tensors to the input convolution's dtype. For FP8 input weights, it uses BF16 when BF16 tensors are present in the checkpoint, otherwise FP16. Uniform FP16/BF16/FP32 checkpoints retain their precision. Conversion happens before registration with ComfyUI's model manager.
+
 Download the checkpoint from [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) and place it under `ComfyUI/models/latent_upscale_models/`, then restart ComfyUI. The H3 node selects the first detected filename containing `h3`; if none is found, the default is `none`.
 
 ## Nodes
@@ -46,6 +48,8 @@ The transition does not add a denoiser evaluation. The final low-resolution Eule
 `[SelfLift plan]` records the actual low/target latent shapes after rounding, spatial lift ratios, low/high NFE counts, transition prediction/resume sigmas, CFG and enabled lift routes. These are latent dimensions, not decoded pixel dimensions. `[SelfLift upscaler]` records the checkpoint, dtype, scale embedding, chunk/overlap, number of windows, largest actual input window and conservative workspace budget. Window lengths include padding and overlap and are measured in latent time positions, not video frames. `estimated_workspace` is a heuristic passed to ComfyUI, not measured peak memory or a hard cap; model weights are accounted for separately by the manager.
 
 Both nodes log `[SelfLift timing]` messages for low-resolution sampling, the transition (endpoint preparation, paired lifts, correction/debug output, and re-noising), and high-resolution sampling. Sampling logs include each step and the stage total. The first step includes sampler/model preparation; callback intervals include previews and the preceding Euler update. The stage total also includes final updates, cleanup, and, for the high-resolution stage, output transfer. These are wall-clock measurements, not isolated GPU kernel timings.
+
+Progress and transition capture use a local callback count for each stage, so wrappers with offset step numbers do not shift the transition. Each stage must still emit one callback per Euler evaluation; missing or extra callbacks produce an explicit error.
 
 Timing does not force CUDA synchronization by default. For synchronized diagnostic measurements, set `SELFLIFT_TIMING_SYNC=1` before starting ComfyUI. This synchronizes the model's CUDA device at timing boundaries and can reduce execution overlap; leave it unset for normal use. CPU execution never invokes CUDA synchronization.
 

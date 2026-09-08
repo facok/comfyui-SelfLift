@@ -13,6 +13,8 @@ H3 节点提供两种不同模式：
 
 ## 可选 H3 upscaler
 
+加载器会将浮点权重、偏置和归一化张量统一到输入卷积的精度。输入权重为 FP8 时，若 checkpoint 中存在 BF16 张量则采用 BF16，否则采用 FP16。纯 FP16/BF16/FP32 模型保留原精度。转换发生在向 ComfyUI 模型管理器注册之前。
+
 从 [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) 下载 checkpoint，放入 `ComfyUI/models/latent_upscale_models/`，然后重启 ComfyUI。H3 节点默认选择检测到的第一个文件名包含 `h3` 的模型；如果没有找到，则默认使用 `none`。
 
 ## 节点
@@ -46,6 +48,8 @@ H3 节点提供两种不同模式：
 `[SelfLift plan]` 记录舍入后的低分辨率和目标 latent 形状、空间提升倍率、低/高分辨率 NFE、过渡预测和恢复采样的 sigma、CFG 及启用的提升路径。这些是 latent 尺寸，不是解码后的像素尺寸。`[SelfLift upscaler]` 记录模型文件、精度、尺度嵌入、分块/重叠长度、窗口数量、实际最大输入窗口和保守工作区预算。窗口包含填充和重叠，单位为 latent 时间位置，不是视频帧。`estimated_workspace` 是交给 ComfyUI 的启发式预算，不是实测峰值或显存硬上限；模型权重由管理器另外计算。
 
 两个节点都会输出 `[SelfLift timing]` 日志，记录低分辨率采样、过渡阶段（端点准备、成对提升、修正及调试输出、重新加噪）和高分辨率采样。采样日志包含逐步耗时和阶段总耗时。首步包含采样器及模型准备；回调之间的计时包含预览和前一步的 Euler 更新。阶段总耗时还包含最终更新、清理，以及高分辨率阶段的输出传输。这些是墙钟时间，不是独立的 GPU kernel 耗时。
+
+进度与过渡状态捕获使用各阶段的本地回调计数，因此外部封装带偏移的步号不会改变过渡位置。每次 Euler 评估仍须对应一次回调；缺失或多余的回调会给出明确错误。
 
 默认计时不强制同步 CUDA。需要同步诊断时，在启动 ComfyUI 前设置 `SELFLIFT_TIMING_SYNC=1`，即可在计时边界同步模型所在的 CUDA 设备；这可能减少执行重叠，正常使用时无需设置。CPU 执行不会调用 CUDA 同步。
 

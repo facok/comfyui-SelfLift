@@ -216,8 +216,14 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
         positive_low, negative_low = positive, negative
 
     transition = {}
+    low_evaluations = 0
 
     def callback_low(step, x0, x, total):
+        nonlocal low_evaluations
+        step = low_evaluations
+        low_evaluations += 1
+        if low_evaluations > transition_step:
+            raise RuntimeError("SelfLift: too many low-resolution callbacks for the Euler schedule")
         if step == transition_step - 1:
             transition["state"] = x
             transition["x0"] = x0
@@ -233,6 +239,8 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
                           sampler, sigmas[:transition_step + 1], model.model_options,
                           latent_image=low_latent, callback=callback_low,
                           disable_pbar=disable_pbar, seed=seed)
+    if low_evaluations != transition_step:
+        raise RuntimeError(f"SelfLift: expected {transition_step} low-resolution callbacks, received {low_evaluations}; check sampler wrappers")
     low_timer.finish()
     log_memory("low_resolution end", model.load_device)
     transition_timer = _StageTimer("transition", model.load_device)
@@ -286,7 +294,14 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     transition_timer.finish()
     log_memory("transition end / high_resolution start", model.load_device)
 
+    high_evaluations = 0
+
     def callback_high(step, x0, x, total):
+        nonlocal high_evaluations
+        step = high_evaluations
+        high_evaluations += 1
+        if high_evaluations > total_steps - transition_step:
+            raise RuntimeError("SelfLift: too many high-resolution callbacks for the Euler schedule")
         result = callback(step + transition_step, x0, x, total_steps)
         high_timer.mark(f"step {step + 1}/{total_steps - transition_step}" + (" (includes setup)" if step == 0 else ""))
         return result
@@ -297,6 +312,8 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
                                 latent_image=resume_latent, callback=callback_high,
                                 disable_pbar=disable_pbar, seed=seed)
     del resume_latent, resume_noise
+    if high_evaluations != total_steps - transition_step:
+        raise RuntimeError(f"SelfLift: expected {total_steps - transition_step} high-resolution callbacks, received {high_evaluations}; check sampler wrappers")
 
     result = latent_image.copy()
     result["samples"] = out.to(device=comfy.model_management.intermediate_device(),
