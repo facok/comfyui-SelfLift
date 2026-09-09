@@ -1,6 +1,7 @@
 """Experimental spatial tiling of H3 high-resolution model evaluations."""
 
 from functools import partial
+import inspect
 import logging
 import math
 
@@ -29,14 +30,20 @@ def _regions(length, tile_count=2):
     return regions
 
 
+def _packed_layout(signature, payload):
+    options = {"keyframes": payload.get("keyframes"), "refs": payload.get("refs")}
+    if "frame_count" in inspect.signature(PackedLayout).parameters:
+        options["frame_count"] = payload.get("frame_count")
+    return PackedLayout(*signature, **options)
+
+
 def _tile_payload(payload, context, video, audio, axis, start, end):
     height, width = video.shape[-2:]
     padded_height, padded_width = (height + 1) // 2 * 2, (width + 1) // 2 * 2
     full_layout = payload.get("layout")
     signature = (context.shape[1], video.shape[2], padded_height, padded_width, audio.shape[-1])
     if full_layout is None or full_layout.signature != signature:
-        full_layout = PackedLayout(*signature, keyframes=payload.get("keyframes"),
-                                   refs=payload.get("refs"), frame_count=payload.get("frame_count"))
+        full_layout = _packed_layout(signature, payload)
     tiled = payload.copy()
     if payload.get("keyframes"):
         keyframes = []
@@ -52,10 +59,8 @@ def _tile_payload(payload, context, video, audio, axis, start, end):
             tiled["cond_video_latents"] = [keyframe["latent"] for keyframe in keyframes]
     tile_height = end - start if axis == 3 else height
     tile_width = end - start if axis == 4 else width
-    layout = PackedLayout(context.shape[1], video.shape[2], (tile_height + 1) // 2 * 2,
-                          (tile_width + 1) // 2 * 2, audio.shape[-1],
-                          keyframes=tiled.get("keyframes"), refs=tiled.get("refs"),
-                          frame_count=tiled.get("frame_count"))
+    layout = _packed_layout((context.shape[1], video.shape[2], (tile_height + 1) // 2 * 2,
+                             (tile_width + 1) // 2 * 2, audio.shape[-1]), tiled)
     for (source_start, source_end, kind), (target_start, target_end, _) in zip(full_layout.segments, layout.segments):
         positions = full_layout.position_ids[source_start:source_end]
         if kind in ("cond", "video"):
@@ -181,12 +186,11 @@ def _available_workspace(model):
     reclaimable = 0
     seen = set()
     for loaded in manager.loaded_models():
-        # ComfyUI currently returns ModelPatcher objects, while older builds
-        # may expose a LoadedModel wrapper around one.
-        patcher = getattr(loaded, "model", loaded)
+        patcher = loaded if callable(getattr(loaded, "loaded_size", None)) else loaded.model
         load_device = getattr(patcher, "load_device", None)
-        if load_device == model.load_device and id(patcher) not in seen:
-            seen.add(id(patcher))
+        identity = id(patcher.model)
+        if load_device == model.load_device and identity not in seen:
+            seen.add(identity)
             size_fn = getattr(patcher, "loaded_size", None)
             if callable(size_fn):
                 reclaimable += size_fn()
