@@ -243,7 +243,22 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
         if step == transition_step - 1:
             transition["state"] = x
             transition["x0"] = x0
-        result = callback(step, x0, x, total_steps)
+        # Preview decoders expect the target grid.  Decode a temporary lifted
+        # preview while keeping the sampler state at its true low resolution.
+        preview_x0 = x0
+        if video:
+            preview_streams, preview_nested = _streams(x0)
+            preview_video = torch.nn.functional.interpolate(
+                preview_streams[0].float(), size=(t, H, W), mode="trilinear", align_corners=False
+            ).to(preview_streams[0].dtype)
+            preview_x0 = _pack([preview_video] + preview_streams[1:], preview_nested)
+            del preview_video, preview_streams
+        elif x0.ndim == 4:
+            preview_x0 = torch.nn.functional.interpolate(
+                x0.float(), size=(H, W), mode="bilinear", align_corners=False
+            ).to(x0.dtype)
+        result = callback(step, preview_x0, preview_x0, total_steps)
+        del preview_x0
         low_timer.mark(f"step {step + 1}/{transition_step}" + (" (includes setup)" if step == 0 else ""))
         return result
 
