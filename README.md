@@ -64,7 +64,7 @@ The transition finishes the audio boundary update early and releases obsolete lo
 
 ## Applicability
 
-`latent_image` must be an all-zero size template, including any audio streams. Encoded/init latents and `noise_mask` are rejected before sampling; img2img and inpainting through this input are not supported. H3 keyframes and references supplied through conditioning remain supported.
+`latent_image` defines the target size and may contain an existing initialization latent, including audio streams. `noise_mask` is still rejected; H3 keyframes and references supplied through conditioning remain supported.
 
 `sigmas` must be a one-dimensional floating-point tensor with finite, nonnegative, non-increasing values. Only the final sigma may be zero, and the high-resolution starting sigma (`sigmas[transition_step]`) must be less than 1. Empty and single-value schedules return the input unchanged. Active schedules need at least two steps; `lowres_scale` must be between 0.25 and 1. A nonzero final sigma retains the sampler's partial-denoising behavior. `lowres_scale=1` still performs the transition and re-noising; use a native sampler for a full-resolution baseline.
 

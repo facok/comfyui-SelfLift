@@ -113,8 +113,6 @@ def _validate_latent_input(latent_image):
     for stream in streams:
         if stream.ndim == 0 or any(size == 0 for size in stream.shape) or stream.shape[0] != streams[0].shape[0]:
             raise ValueError("SelfLift: latent streams must be nonempty and have the same batch size")
-        if torch.count_nonzero(stream) != 0:
-            raise ValueError("SelfLift: latent_image must be an all-zero size template; encoded/init latents are not supported")
 
 
 def _euler_step(state, denoised, sigma, sigma_next):
@@ -336,7 +334,7 @@ class SelfLiftH3Sampler:
             "positive": ("CONDITIONING",),
             "negative": ("CONDITIONING",),
             "vae": ("VAE", {"tooltip": "Video VAE used for the pixel re-encode anchor at the resolution transition."}),
-            "latent_image": ("LATENT", {"tooltip": "All-zero target-resolution latent (e.g. Empty MiniMax H3 AV Latent), defines size and duration. Encoded/init latents and noise masks are not supported; supply keyframes through conditioning."}),
+            "latent_image": ("LATENT", {"tooltip": "Target-resolution H3 AV latent defining size and duration. Existing latent content is accepted; noise masks are not supported."}),
             "sampler": ("SAMPLER", {"tooltip": "Standard Euler only; SelfLift reuses its transition-step prediction to keep the original NFE count."}),
             "sigmas": ("SIGMAS",),
             "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
@@ -377,7 +375,7 @@ class SelfLiftImageSampler:
             "positive": ("CONDITIONING",),
             "negative": ("CONDITIONING",),
             "vae": ("VAE", {"tooltip": "VAE used for the pixel re-encode anchor at the resolution transition."}),
-            "latent_image": ("LATENT", {"tooltip": "All-zero target-resolution latent (e.g. Empty Latent Image), defines the output size. Encoded/init latents and noise masks are not supported."}),
+            "latent_image": ("LATENT", {"tooltip": "Target-resolution latent defining the output size. Existing latent content is accepted; noise masks are not supported."}),
             "sampler": ("SAMPLER", {"tooltip": "Standard Euler only; SelfLift reuses its transition-step prediction to keep the original NFE count."}),
             "sigmas": ("SIGMAS",),
             "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
