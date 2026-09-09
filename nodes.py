@@ -34,13 +34,19 @@ from .diagnostics import log_memory
 
 
 class _StageTimer:
-    def __init__(self, stage, device):
+    def __init__(self, stage, device, resolution=None, pixel_scale=1):
         self.stage = stage
+        self.resolution = resolution
+        self.pixel_scale = pixel_scale
         self.device = torch.device(device)
         self.synchronize = os.environ.get("SELFLIFT_TIMING_SYNC", "0") == "1" and self.device.type == "cuda"
         self.started = self.previous = self._now()
-        logging.info("[SelfLift timing] %s start (%s)", stage,
-                     "CUDA-synchronized wall time" if self.synchronize else "wall time; no forced CUDA sync")
+        timing_mode = "CUDA-synchronized wall time" if self.synchronize else "wall time; no forced CUDA sync"
+        suffix = ""
+        if resolution is not None:
+            pixels = tuple(int(value * self.pixel_scale) for value in resolution)
+            suffix = f" latent={resolution} pixels={pixels}"
+        logging.info("[SelfLift timing] %s start (%s)%s", stage, timing_mode, suffix)
 
     def _now(self):
         if self.synchronize:
@@ -202,8 +208,17 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
                  rho > 0.0 and w_max > 0.0, cfg)
 
     device = comfy.model_management.intermediate_device()
-    low_latent = _pack([torch.zeros(low_shape, device=device)] +
-                       [torch.zeros_like(s) for s in streams[1:]], nested)
+    source_video = streams[0].to(device)
+    if video:
+        low_video = torch.nn.functional.interpolate(
+            source_video.float(), size=(t, h, w), mode="trilinear", align_corners=False
+        ).to(dtype=source_video.dtype)
+    else:
+        low_video = torch.nn.functional.interpolate(
+            source_video.float(), size=(h, w), mode="bilinear", align_corners=False
+        ).to(dtype=source_video.dtype)
+    low_latent = _pack([low_video] + [s.to(device) for s in streams[1:]], nested)
+    del source_video, low_video
     del streams
     noise_low = comfy.sample.prepare_noise(low_latent, seed, latent_image.get("batch_index", None))
 
@@ -234,7 +249,9 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
 
     # The final low-resolution model evaluation is the Eq. 3 prediction. Its Euler
     # update is discarded and rebuilt after the resolution transition, preserving NFE.
-    low_timer = _StageTimer("low_resolution", model.load_device)
+    resolution_scale = (getattr(model.get_model_object("latent_format"), "spacial_downscale_ratio", 1)
+                        if video else getattr(model.get_model_object("latent_format"), "spacial_downscale_ratio", 1))
+    low_timer = _StageTimer("low_resolution", model.load_device, (h, w), resolution_scale)
     log_memory("low_resolution start", model.load_device)
     comfy.samplers.sample(model, noise_low, positive_low, negative_low, cfg, model.load_device,
                           sampler, sigmas[:transition_step + 1], model.model_options,
@@ -244,7 +261,7 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
         raise RuntimeError(f"SelfLift: expected {transition_step} low-resolution callbacks, received {low_evaluations}; check sampler wrappers")
     low_timer.finish()
     log_memory("low_resolution end", model.load_device)
-    transition_timer = _StageTimer("transition", model.load_device)
+    transition_timer = _StageTimer("transition", model.load_device, (H, W), resolution_scale)
     low_streams, nested = _streams(transition.pop("state"))
     x0_streams, _ = _streams(transition.pop("x0"))
     sigma_k = sigmas[transition_step - 1]
@@ -307,7 +324,7 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
         high_timer.mark(f"step {step + 1}/{total_steps - transition_step}" + (" (includes setup)" if step == 0 else ""))
         return result
 
-    high_timer = _StageTimer("high_resolution", model.load_device)
+    high_timer = _StageTimer("high_resolution", model.load_device, (H, W), resolution_scale)
     if highres_tiling:
         logging.info("[SelfLift plan] automatic high-resolution tiling enabled; preparation selects the tile count")
     out = comfy.samplers.sample(high_model, resume_noise, positive, negative, cfg, model.load_device,
