@@ -32,7 +32,7 @@ H3 节点的 `highres_tiling`（高分辨率分块）开关默认关闭。开启
 两个节点使用与 `SamplerCustom` 相同的 `sampler`/`sigmas` 接口。`KSamplerSelect` 必须选择标准 `euler`，调度器仍使用模型原有配置。其他 sampler 会被拒绝，因为拆分多步、祖先或 SDE 求解器会重置历史状态或改变随机过程。
 
 - **SelfLift Progressive Sampler (MiniMax H3)**（`selflift`）：H3 音视频 latent（如 *Empty MiniMax H3 AV Latent*）。音频流没有空间维度，会使用复用的 Euler 边界预测继续推进而不做空间提升；关键帧条件 latent 会在前缀阶段同步缩放到低分辨率网格。这是工程扩展，不是论文验证过的配置。
-- **SelfLift Progressive Sampler (Image)**（`selflift`）：4D 图像 latent（如 *Empty Latent Image*）。
+- **SelfLift Progressive Sampler (Image)**（`selflift`）：论文 SelfLift-zero 在兼容 rectified-flow 图像骨干上的实现。用途是给少步数图像生成提速：大部分去噪评估跑在降低的空间分辨率上，只有剩余步骤在全分辨率，代价是过渡点一次 VAE 解码 → 上采样 → 重编码往返。论文验证过的配置：Z-Image-Turbo（8 步：`transition_step=6`、`rho=0.3`）和 FLUX.2-Klein（4 步：`transition_step=3`、`rho=0.4`）。接入 4D 图像 latent（如 *Empty Latent Image*）、标准 Euler 采样器、模型原调度器，以及模型所属 VAE（用于像素锚点）。其它 rectified-flow 图像骨干理论上可用但未经验证；低分辨率前缀决定构图，因此骨干少步输出的全局结构越稳定，效果越好。
 - **H3 Temporal State Transport (TST)**（`selflift`）：`MODEL` → `MODEL` 补丁节点，把免训练的 Temporal State Transport 校正（TST，[arXiv:2609.08505](https://arxiv.org/abs/2609.08505)）应用到 H3 的联合 packed 注意力上。可配合任意标准采样节点（KSampler/SamplerCustom），不限于 SelfLift 采样器。详见下方专门章节。
 
 ### 参数
