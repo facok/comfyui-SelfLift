@@ -25,6 +25,7 @@ TST skips with a warning instead of mislocating the tile's video rows.
 
 import logging
 import math
+import time
 from functools import partial
 
 import torch
@@ -76,6 +77,7 @@ def _attention_override(state):
                 state["guard_misses"] += 1
             return func(q, k, v, heads, mask=mask, **kwargs)
         state["calls_this_forward"] += 1
+        tst_start = time.perf_counter()
         layers = state["layers"]
         layer = (state["calls_this_forward"] - 1) % layers
         total_steps = state["total_steps"]
@@ -86,20 +88,23 @@ def _attention_override(state):
         gamma = torch.exp(tension * (state["tau"] * layer_weight * step_weight))
         if state["tau"] != 0.0:
             qt[0, :, s - frames * rows:].mul_(gamma.to(qt.dtype)[:, None, None])
+        state["fw_tst_time"].append(time.perf_counter() - tst_start)
         if state["log_diagnostics"]:
             state["fw_abs_tension"].append(float(tension.abs().mean()))
             state["fw_gamma"].append(float(gamma.mean()))
             state["fw_active"].append(float(((gamma - 1.0).abs() > 0.03).float().mean()))
             if layer == layers - 1 and state["fw_gamma"]:
                 logging.info(
-                    "[H3 TST] step %d/%d frames=%d grid_rows=%d mean|T|=%.4f mean_gamma=%.4f active_heads=%.0f%%",
+                    "[H3 TST] step %d/%d frames=%d grid_rows=%d mean|T|=%.4f mean_gamma=%.4f active_heads=%.0f%% tst_time=%.1fms",
                     state["step"], total_steps, frames, rows,
                     sum(state["fw_abs_tension"]) / len(state["fw_abs_tension"]),
                     sum(state["fw_gamma"]) / len(state["fw_gamma"]),
-                    100.0 * sum(state["fw_active"]) / len(state["fw_active"]))
+                    100.0 * sum(state["fw_active"]) / len(state["fw_active"]),
+                    1000.0 * sum(state["fw_tst_time"]))
                 state["fw_abs_tension"].clear()
                 state["fw_gamma"].clear()
                 state["fw_active"].clear()
+                state["fw_tst_time"].clear()
         return func(q, k, v, heads, mask=mask, **kwargs)
     return override
 
@@ -117,6 +122,8 @@ def _forward_wrapper(state, executor, x, timestep, context, transformer_options,
         state["warned_inactive"] = True
     state["calls_this_forward"] = 0
     state["guard_misses"] = 0
+    # diagnostics off leaves fw_tst_time unreported; drop it per forward instead of leaking floats
+    state["fw_tst_time"].clear()
     video = x[0] if isinstance(x, (list, tuple)) else x
     if isinstance(video, torch.Tensor) and video.ndim == 5:
         state["frames"] = int(video.shape[2])
@@ -136,7 +143,7 @@ def patch_model(model, tau, log_diagnostics=True):
              "frames": None, "rows_per_frame": None,
              "step": 0, "total_steps": 1, "layers": 50, "calls_this_forward": 0,
              "guard_misses": 0, "warned_inactive": False,
-             "fw_abs_tension": [], "fw_gamma": [], "fw_active": []}
+             "fw_abs_tension": [], "fw_gamma": [], "fw_active": [], "fw_tst_time": []}
     patched = model.clone()
     patched.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
                                  "selflift_h3_tst", partial(_forward_wrapper, state))
