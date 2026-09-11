@@ -25,6 +25,7 @@ TST skips with a warning instead of mislocating the tile's video rows.
 
 import logging
 import math
+import os
 import time
 from functools import partial
 
@@ -53,6 +54,39 @@ def _spectral_tension(q, k, v0, frames, rows_per_frame, eps=1e-8):
     kv = k[0, :, v0:].reshape(heads, frames, rows_per_frame, head_dim).mean(dim=2).float()
     a = (qv @ kv.transpose(-2, -1) * head_dim**-0.5).softmax(dim=-1).clamp(min=eps)
     log_f = math.log(frames)
+    h_row = -(a * a.log()).sum(dim=-1).mean(dim=-1) / log_f
+    gram = a @ a.transpose(-2, -1)
+    trace = gram.diagonal(dim1=-2, dim2=-1).sum(dim=-1).clamp(min=eps)
+    eig = torch.linalg.eigvalsh(gram / trace[:, None, None]).clamp(min=eps)
+    eig = eig / eig.sum(dim=-1, keepdim=True).clamp(min=eps)
+    h_vn = -(eig * eig.log()).sum(dim=-1) / log_f
+    return h_row - h_vn
+
+
+def _exact_tension(q, k, v0, frames, rows_per_frame, eps=1e-8, chunk=64):
+    """Exact frame-mass operator tension, for calibrating the pooled prototype.
+
+    Per query token: full-row softmax over the whole packed sequence, video-key
+    mass summed per frame, averaged over the frame's query rows, rows
+    renormalized over frames (the true joint-attention transport operator).
+    q, k: [1, heads, S, head_dim]; returns [heads] fp32 like _spectral_tension.
+    """
+    heads = q.shape[1]
+    head_dim = q.shape[-1]
+    qv = q[0, :, v0:]
+    k_all = k[0].float()
+    log_f = math.log(frames)
+    a = q.new_zeros(heads, frames, frames, dtype=torch.float32)
+    for start in range(0, frames * rows_per_frame, chunk):
+        stop = min(start + chunk, frames * rows_per_frame)
+        logits = (qv[:, start:stop].float() @ k_all.transpose(-2, -1)) * head_dim**-0.5
+        m = logits.softmax(dim=-1)[..., v0:]
+        m = m.reshape(heads, stop - start, frames, rows_per_frame).sum(dim=-1)
+        idx = torch.arange(start, stop, device=m.device) // rows_per_frame
+        a.scatter_add_(1, idx.view(1, -1, 1).expand(heads, -1, frames), m)
+        del logits, m
+    a = a / rows_per_frame
+    a = (a / a.sum(dim=-1, keepdim=True).clamp(min=eps)).clamp(min=eps)
     h_row = -(a * a.log()).sum(dim=-1).mean(dim=-1) / log_f
     gram = a @ a.transpose(-2, -1)
     trace = gram.diagonal(dim1=-2, dim2=-1).sum(dim=-1).clamp(min=eps)
@@ -94,6 +128,9 @@ def _attention_override(state):
         step_weight = 0.5 + 0.5 * math.cos(math.pi * step / (total_steps - 1)) if total_steps > 1 else 1.0
         tension = _spectral_tension(qt, _unwrap(k), s - frames * rows, frames, rows)
         gamma = torch.exp(tension * (state["tau"] * layer_weight * step_weight))
+        # calibration probe needs pre-correction q; the scaling below is in place
+        exact_probe = state["exact_debug"] and layer == layers // 2
+        q_pre = qt.clone() if exact_probe else None
         if state["tau"] != 0.0:
             qt[0, :, s - frames * rows:].mul_(gamma.to(qt.dtype)[:, None, None])
         if state["log_diagnostics"]:
@@ -129,6 +166,15 @@ def _attention_override(state):
                 state["fw_active"].clear()
                 state["fw_tst_time"].clear()
                 state["fw_events"].clear()
+        if exact_probe:
+            exact = _exact_tension(q_pre, _unwrap(k), s - frames * rows, frames, rows)
+            del q_pre
+            logging.info(
+                "[H3 TST exact] step %d layer %d/%d: proto_T=%+.4f exact_T=%+.4f proto|T|=%.4f exact|T|=%.4f sign_agree=%.0f%%",
+                state["step"], layer, layers,
+                float(tension.mean()), float(exact.mean()),
+                float(tension.abs().mean()), float(exact.abs().mean()),
+                100.0 * float(((exact > 0) == (tension > 0)).float().mean()))
         return func(q, k, v, heads, mask=mask, **kwargs)
     return override
 
@@ -165,6 +211,7 @@ def _forward_wrapper(state, executor, x, timestep, context, transformer_options,
 
 def patch_model(model, tau, log_diagnostics=True):
     state = {"tau": float(tau), "log_diagnostics": bool(log_diagnostics),
+             "exact_debug": os.environ.get("SELFLIFT_TST_EXACT", "0") == "1",
              "frames": None, "rows_per_frame": None,
              "step": 0, "total_steps": 1, "layers": 50, "calls_this_forward": 0,
              "guard_misses": 0, "warned_inactive": False,
