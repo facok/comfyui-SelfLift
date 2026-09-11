@@ -103,6 +103,10 @@ def _attention_override(state):
             else:
                 state["fw_tst_time"].append(time.perf_counter() - tst_start)
             state["fw_abs_tension"].append(float(tension.abs().mean()))
+            # within-call check (paper appendix Figure A): tension of the corrected
+            # operator must drop below the pre-correction value
+            post = _spectral_tension(qt, _unwrap(k), s - frames * rows, frames, rows) if state["tau"] != 0.0 else tension
+            state["fw_abs_tension_post"].append(float(post.abs().mean()))
             state["fw_gamma"].append(float(gamma.mean()))
             state["fw_active"].append(float(((gamma - 1.0).abs() > 0.03).float().mean()))
             if layer == layers - 1 and state["fw_gamma"]:
@@ -110,14 +114,17 @@ def _attention_override(state):
                 for ev_start, ev_end in state["fw_events"]:
                     ev_end.synchronize()
                     tst_ms += ev_start.elapsed_time(ev_end)
+                n = len(state["fw_abs_tension"])
                 logging.info(
-                    "[H3 TST] step %d/%d frames=%d grid_rows=%d mean|T|=%.4f mean_gamma=%.4f active_heads=%.0f%% tst_time=%.2fs",
+                    "[H3 TST] step %d/%d frames=%d grid_rows=%d pre|T|=%.4f post|T|=%.4f mean_gamma=%.4f active_heads=%.0f%% tst_time=%.2fs",
                     state["step"], total_steps, frames, rows,
-                    sum(state["fw_abs_tension"]) / len(state["fw_abs_tension"]),
+                    sum(state["fw_abs_tension"]) / n,
+                    sum(state["fw_abs_tension_post"]) / len(state["fw_abs_tension_post"]),
                     sum(state["fw_gamma"]) / len(state["fw_gamma"]),
                     100.0 * sum(state["fw_active"]) / len(state["fw_active"]),
                     tst_ms / 1000.0)
                 state["fw_abs_tension"].clear()
+                state["fw_abs_tension_post"].clear()
                 state["fw_gamma"].clear()
                 state["fw_active"].clear()
                 state["fw_tst_time"].clear()
@@ -161,7 +168,8 @@ def patch_model(model, tau, log_diagnostics=True):
              "frames": None, "rows_per_frame": None,
              "step": 0, "total_steps": 1, "layers": 50, "calls_this_forward": 0,
              "guard_misses": 0, "warned_inactive": False,
-             "fw_abs_tension": [], "fw_gamma": [], "fw_active": [], "fw_tst_time": [], "fw_events": []}
+             "fw_abs_tension": [], "fw_abs_tension_post": [], "fw_gamma": [], "fw_active": [],
+             "fw_tst_time": [], "fw_events": []}
     patched = model.clone()
     patched.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
                                  "selflift_h3_tst", partial(_forward_wrapper, state))
