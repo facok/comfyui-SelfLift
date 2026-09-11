@@ -384,7 +384,7 @@ class SelfLiftH3Sampler:
 
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "sample"
-    CATEGORY = "sampling/minimax"
+    CATEGORY = "selflift"
 
     def sample(self, model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
                transition_step, lowres_scale, rho, w_min, w_max, upscaler_model, highres_tiling=False):
@@ -423,7 +423,7 @@ class SelfLiftImageSampler:
 
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "sample"
-    CATEGORY = "sampling"
+    CATEGORY = "selflift"
 
     def sample(self, model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
                transition_step, lowres_scale, rho, w_min, w_max, latent_upsample):
@@ -446,7 +446,7 @@ class SelfLiftH3TST:
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "patch"
-    CATEGORY = "sampling/minimax"
+    CATEGORY = "selflift"
 
     def patch(self, model, tau, log_diagnostics):
         return (h3_tst.patch_model(model, tau, log_diagnostics),)
