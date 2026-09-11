@@ -30,6 +30,7 @@ import latent_preview
 from . import selflift
 from . import h3_upscaler
 from . import h3_tiling
+from . import h3_tst
 from .diagnostics import log_memory
 
 
@@ -430,12 +431,35 @@ class SelfLiftImageSampler:
                                    transition_step, lowres_scale, rho, w_min, w_max, latent_upsample),)
 
 
+class SelfLiftH3TST:
+    """Training-free Temporal State Transport correction (arXiv:2609.08505) for MiniMax H3."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",),
+            "tau": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.05,
+                              "tooltip": "Homeostatic correction strength; 0.2 is the paper setting. 0 disables correction while keeping the diagnostic active."}),
+            "log_diagnostics": ("BOOLEAN", {"default": True, "label_on": "诊断日志：开启", "label_off": "诊断日志：关闭",
+                                            "tooltip": "Log per-forward Spectral Tension and correction statistics to the console."}),
+        }}
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "sampling/minimax"
+
+    def patch(self, model, tau, log_diagnostics):
+        return (h3_tst.patch_model(model, tau, log_diagnostics),)
+
+
 NODE_CLASS_MAPPINGS = {
     "SelfLiftH3Sampler": SelfLiftH3Sampler,
     "SelfLiftImageSampler": SelfLiftImageSampler,
+    "SelfLiftH3TST": SelfLiftH3TST,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SelfLiftH3Sampler": "SelfLift Progressive Sampler (MiniMax H3)",
     "SelfLiftImageSampler": "SelfLift Progressive Sampler (Image)",
+    "SelfLiftH3TST": "H3 Temporal State Transport (SelfLift)",
 }
