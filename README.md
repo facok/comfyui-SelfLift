@@ -23,6 +23,7 @@ Both nodes use `sampler`/`sigmas` inputs like `SamplerCustom`. Connect the stand
 
 - **SelfLift Progressive Sampler (MiniMax H3)** (`sampling/minimax`): H3 AV latents (e.g. from *Empty MiniMax H3 AV Latent*). The audio stream has no spatial dimensions and continues the reused Euler boundary step without spatial lifting; keyframe condition latents are rescaled to the low-res grid for the prefix. This is an engineering extension, not a configuration validated by the paper.
 - **SelfLift Progressive Sampler (Image)** (`sampling`): 4D image latents (e.g. *Empty Latent Image*).
+- **H3 Temporal State Transport (SelfLift)** (`sampling/minimax`): `MODEL` → `MODEL` patch node applying training-free Temporal State Transport correction (TST, [arXiv:2609.08505](https://arxiv.org/abs/2609.08505)) to H3's joint packed attention. Place it upstream of the H3 sampler. See the dedicated section below.
 
 ### Parameters
 
@@ -43,6 +44,21 @@ Both nodes use `sampler`/`sigmas` inputs like `SamplerCustom`. Connect the stand
 The image defaults match the paper's 8-step Z-Image-Turbo setup. For the 4-step FLUX.2-Klein setup, change `transition_step` to `3` and `rho` to `0.4`.
 
 The transition does not add a denoiser evaluation. The final low-resolution Euler evaluation supplies Eq. 3; after lifting and re-noising, its prediction also completes that Euler interval. With tiling off, a schedule with `N` steps therefore remains exactly `N` NFEs: `transition_step` at low resolution and the rest at target resolution. Tiling preserves the number of Euler updates and progress callbacks but doubles the spatial model forwards per high-resolution evaluation when two tiles are used (before accounting for CFG). SelfLift-zero adds one VAE decode → resize → encode round trip unless `rho=0` or both correction weights are zero. With an H3 checkpoint installed, the H3 defaults take the latent-only external path. Select `upscaler_model=none` and set `rho>0` with nonzero correction weights to run SelfLift-zero.
+
+## H3 Temporal State Transport (TST)
+
+An experimental port of [TST](https://github.com/lytang63/temporal-state-transport) to MiniMax H3. The paper evaluates Wan2.2, not H3; this node is an engineering adaptation, not a validated configuration. TST diagnoses temporal attention instead of blindly strengthening it: fragmented transport (attention mass concentrated on too few frames) drifts details, while over-mixing (mass spread too uniformly) breaks motion physics.
+
+H3 has no separate temporal attention — it is a single-stream transformer over packed `[text | cond/refs | audio | video]` tokens — so the node builds the frame-level transport operator `A` (F×F) per head from spatial mean-pooled post-RoPE queries/keys of the video segment (always the last packed segment), computes Spectral Tension `T = H_row - H_vN` (paper Eqs. 1–3), and applies the homeostatic query temperature `γ = exp(τ_eff · T)` to video-row queries only (paper Eqs. 5–6). Positive tension sharpens, negative softens. `τ_eff` follows the paper's cosine schedules: stronger in deeper layers and earlier denoising steps. Text, audio and reference rows are never rescaled. The intervention runs inside ComfyUI's `optimized_attention_override` hook, so it is backend-agnostic (sage/flash/SDPA/kitchen) and adds negligible cost (pooled F×F statistics per call).
+
+- `tau`: correction strength; `0.2` is the paper setting. `0` disables correction while keeping the diagnostic active.
+- `log_diagnostics`: logs one `[H3 TST]` line per model forward with the step, latent frame count, per-frame grid rows, mean absolute tension `|T|`, mean `γ`, and the fraction of heads with `|γ-1| > 0.03`. Per-head tension is measured before each call's own correction; cross-step movement reflects corrections from earlier calls and steps.
+
+Frame count and per-frame grid rows are captured per forward, so the low- and high-resolution phases of the SelfLift sampler are each handled correctly. Layer indices come from actual video-attention call counts; step indices match the current sigma against `sample_sigmas`, so no call-count assumptions break under CFG or phase splits.
+
+A single-workflow, single-seed sweep (Ref2VA, 5 s, 9-step Euler, CFG 1) found net **positive** tension on this content (the over-mixing direction, opposite to the fragmentation dominance reported for Wan), baseline `|T|` rising from 0.449 at the first step to 0.486 at the last, and a dose-response curve with the measured `|T|` minimum at `tau=0.2`. At `tau=0.5`, `|T|` rose above baseline and on-screen text/details visibly degraded, matching the paper's warning about oversized `tau`. This is one seed on one prompt; treat `0.2` as a starting point and re-validate per content.
+
+Limitations: TST is **not compatible with `highres_tiling`** — wrappers run in registration order, so the node only sees the full-resolution shape outside the tiling wrapper; tile attention calls fail the length guard and TST is skipped with a console warning. The pooled-prototype operator is an approximation of the exact video→video attention mass, and scaling video queries also shifts their attention to text/audio columns (the paper's Wan target has separate temporal attention, so this leakage does not exist there). Neither approximation has been calibrated against ground truth yet.
 
 ## Timing and transition memory
 
@@ -93,6 +109,7 @@ SelfLift-rich (the distilled latent lifter + On-Policy Self Recovery) requires t
 ## References and acknowledgements
 
 - SelfLift paper: [SelfLift: Accelerating Few-Step Diffusion via Self-Recovering Resolution Transition](https://arxiv.org/abs/2609.02036)
+- TST paper and code: [Temporal State Transport in Video Generation](https://arxiv.org/abs/2609.08505), [lytang63/temporal-state-transport](https://github.com/lytang63/temporal-state-transport)
 - Optional MiniMax H3 latent upscaler checkpoint and download: [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
 - Original ComfyUI integration and inference implementation: [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler)
 

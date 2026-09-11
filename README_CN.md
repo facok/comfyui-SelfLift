@@ -33,6 +33,7 @@ H3 节点的 `highres_tiling`（高分辨率分块）开关默认关闭。开启
 
 - **SelfLift Progressive Sampler (MiniMax H3)**（`sampling/minimax`）：H3 音视频 latent（如 *Empty MiniMax H3 AV Latent*）。音频流没有空间维度，会使用复用的 Euler 边界预测继续推进而不做空间提升；关键帧条件 latent 会在前缀阶段同步缩放到低分辨率网格。这是工程扩展，不是论文验证过的配置。
 - **SelfLift Progressive Sampler (Image)**（`sampling`）：4D 图像 latent（如 *Empty Latent Image*）。
+- **H3 Temporal State Transport (SelfLift)**（`sampling/minimax`）：`MODEL` → `MODEL` 补丁节点，把免训练的 Temporal State Transport 校正（TST，[arXiv:2609.08505](https://arxiv.org/abs/2609.08505)）应用到 H3 的联合 packed 注意力上，放在 H3 采样器上游使用。详见下方专门章节。
 
 ### 参数
 
@@ -52,6 +53,21 @@ H3 节点的 `highres_tiling`（高分辨率分块）开关默认关闭。开启
 图像节点默认值对应论文的 8-step Z-Image-Turbo 配置。使用 4-step FLUX.2-Klein 时，应把 `transition_step` 改为 `3`，并把 `rho` 改为 `0.4`。
 
 转换不会增加 denoiser evaluation。最后一次低分辨率 Euler 评估直接提供式 3 的预测；提升并重新加噪后，同一预测继续完成该 Euler 区间。包含 `N` 步的 schedule 因而仍严格保持 `N` NFE：其中 `transition_step` 次在低分辨率，其余在目标分辨率。除非 `rho=0` 或两个修正权重均为零，SelfLift-zero 还会增加一次 VAE 解码 → 缩放 → 编码往返。安装 H3 checkpoint 后，H3 默认走外部纯 latent 路径。要运行 SelfLift-zero，请选择 `upscaler_model=none`，设置 `rho>0` 并使用非零修正权重。
+
+## H3 Temporal State Transport (TST)
+
+[TST](https://github.com/lytang63/temporal-state-transport) 到 MiniMax H3 的实验性移植。原论文只在 Wan2.2 上验证，未验证 H3；本节点是工程适配，不是经过验证的配置。TST 不盲目加强时间注意力，而是先做诊断：碎片化传输（注意力质量集中在过少帧上）会让细节漂移，过度混合（质量过于均匀地摊开）会破坏运动物理。
+
+H3 没有独立的时间注意力——它是在 `[text | cond/refs | audio | video]` 打包序列上的单流 transformer——因此节点对 video 段（永远是最后一个打包段）的 post-RoPE query/key 做帧内空间均值池化，逐头构造帧级传输算子 `A`（F×F），计算谱张力 `T = H_row - H_vN`（论文式 1–3），并只对 video 行的 query 施加稳态温度 `γ = exp(τ_eff · T)`（论文式 5–6）。张力为正则锐化，为负则软化。`τ_eff` 沿用论文余弦调度：更深的层和更早的去噪步校正更强。text、audio、reference 行从不被缩放。干预通过 ComfyUI 的 `optimized_attention_override` 钩子实现，与注意力后端无关（sage/flash/SDPA/kitchen 均可），每次调用只增加可忽略的 F×F 统计开销。
+
+- `tau`：校正强度，论文默认 `0.2`；`0` 关闭校正但保留诊断。
+- `log_diagnostics`：每次模型前向输出一行 `[H3 TST]` 日志，包含步号、latent 帧数、每帧网格行数、平均张力绝对值 `|T|`、平均 `γ`、以及 `|γ-1| > 0.03` 的头比例。逐头张力在每次调用自身校正之前测量；跨步的变化反映之前调用和之前步的校正效果。
+
+帧数和每帧网格行数按前向捕获，SelfLift 采样器的低/高分辨率两个阶段各自正确处理。层号来自实际视频注意力调用计数；步号用当前 sigma 在 `sample_sigmas` 中匹配，不依赖任何会在 CFG 或阶段拆分下失效的调用计数假设。
+
+一次单工作流、单 seed 的扫描（Ref2VA、5 秒、9-step Euler、CFG 1）发现：该内容上张力净值为**正**（过度混合方向，与 Wan 上报告的碎片化主导相反）；基线 `|T|` 从首步 0.449 上升到末步 0.486；剂量响应曲线在 `tau=0.2` 处测得 `|T|` 最低。`tau=0.5` 时 `|T|` 反超基线，画面中的文字和细节可见退化，与论文对过大 `tau` 的警告一致。这只是单一 prompt 单一 seed 的结果；请把 `0.2` 当作起点，按内容重新验证。
+
+限制：TST **与 `highres_tiling` 不兼容**——wrapper 按注册顺序执行，本节点只能看到分块 wrapper 之外的完整分辨率形状，tile 注意力调用会被长度守卫拦截，TST 跳过并在控制台给出警告。池化原型算子是精确 video→video 注意力质量的近似；缩放 video query 也会同时改变它对 text/audio 列的注意力（论文的 Wan 目标有独立时间注意力，不存在这种泄漏）。这两处近似都还没有与真值校准。
 
 ## 阶段计时与过渡内存
 
@@ -100,6 +116,7 @@ SelfLift-rich（蒸馏 latent 提升器 + On-Policy Self Recovery）需要训练
 ## 引用与致谢
 
 - SelfLift 论文：[SelfLift: Accelerating Few-Step Diffusion via Self-Recovering Resolution Transition](https://arxiv.org/abs/2609.02036)
+- TST 论文与代码：[Temporal State Transport in Video Generation](https://arxiv.org/abs/2609.08505)，[lytang63/temporal-state-transport](https://github.com/lytang63/temporal-state-transport)
 - 可选 MiniMax H3 latent upscaler 权重与下载：[LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
 - 原始 ComfyUI 集成与推理实现：[LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler)
 
