@@ -23,7 +23,7 @@ Both nodes use `sampler`/`sigmas` inputs like `SamplerCustom`. Connect the stand
 
 - **SelfLift Progressive Sampler (MiniMax H3)** (`sampling/minimax`): H3 AV latents (e.g. from *Empty MiniMax H3 AV Latent*). The audio stream has no spatial dimensions and continues the reused Euler boundary step without spatial lifting; keyframe condition latents are rescaled to the low-res grid for the prefix. This is an engineering extension, not a configuration validated by the paper.
 - **SelfLift Progressive Sampler (Image)** (`sampling`): 4D image latents (e.g. *Empty Latent Image*).
-- **H3 Temporal State Transport (SelfLift)** (`sampling/minimax`): `MODEL` → `MODEL` patch node applying training-free Temporal State Transport correction (TST, [arXiv:2609.08505](https://arxiv.org/abs/2609.08505)) to H3's joint packed attention. Place it upstream of the H3 sampler. See the dedicated section below.
+- **H3 Temporal State Transport (TST)** (`sampling/minimax`): `MODEL` → `MODEL` patch node applying training-free Temporal State Transport correction (TST, [arXiv:2609.08505](https://arxiv.org/abs/2609.08505)) to H3's joint packed attention. It works with any standard sampler node (KSampler/SamplerCustom), not only the SelfLift sampler. See the dedicated section below.
 
 ### Parameters
 

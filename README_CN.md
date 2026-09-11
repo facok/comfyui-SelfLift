@@ -33,7 +33,7 @@ H3 节点的 `highres_tiling`（高分辨率分块）开关默认关闭。开启
 
 - **SelfLift Progressive Sampler (MiniMax H3)**（`sampling/minimax`）：H3 音视频 latent（如 *Empty MiniMax H3 AV Latent*）。音频流没有空间维度，会使用复用的 Euler 边界预测继续推进而不做空间提升；关键帧条件 latent 会在前缀阶段同步缩放到低分辨率网格。这是工程扩展，不是论文验证过的配置。
 - **SelfLift Progressive Sampler (Image)**（`sampling`）：4D 图像 latent（如 *Empty Latent Image*）。
-- **H3 Temporal State Transport (SelfLift)**（`sampling/minimax`）：`MODEL` → `MODEL` 补丁节点，把免训练的 Temporal State Transport 校正（TST，[arXiv:2609.08505](https://arxiv.org/abs/2609.08505)）应用到 H3 的联合 packed 注意力上，放在 H3 采样器上游使用。详见下方专门章节。
+- **H3 Temporal State Transport (TST)**（`sampling/minimax`）：`MODEL` → `MODEL` 补丁节点，把免训练的 Temporal State Transport 校正（TST，[arXiv:2609.08505](https://arxiv.org/abs/2609.08505)）应用到 H3 的联合 packed 注意力上。可配合任意标准采样节点（KSampler/SamplerCustom），不限于 SelfLift 采样器。详见下方专门章节。
 
 ### 参数
 

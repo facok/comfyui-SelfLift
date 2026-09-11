@@ -461,5 +461,5 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SelfLiftH3Sampler": "SelfLift Progressive Sampler (MiniMax H3)",
     "SelfLiftImageSampler": "SelfLift Progressive Sampler (Image)",
-    "SelfLiftH3TST": "H3 Temporal State Transport (SelfLift)",
+    "SelfLiftH3TST": "H3 Temporal State Transport (TST)",
 }
