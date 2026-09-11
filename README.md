@@ -75,7 +75,8 @@ A controlled single-seed H3 run found: clean native baseline and clean pure pixe
 
 ## Notes and limitations
 
-- Only standard Euler with `s_churn=0`; `noise_mask`/inpainting is not supported.
+- Only standard Euler with `s_churn=0`.
+- `noise_mask` is supported on both samplers with Set Latent Noise Mask semantics (1 = generate, 0 = keep the original content; use an initialized latent to have content worth keeping). Masks at any resolution are resized to the latent grid, and a time length of 1 is shared over all frames. The keep-region is pinned to the original latent at every step, and the artifact-aware correction is restricted to the generate region. `noise_mask` is not compatible with `highres_tiling`.
 - Use the VAE belonging to the sampled model so the pixel anchor stays in the same latent space.
 - H3's 768-pixel short edge becomes 384 px at `lowres_scale=0.5`, which may sit outside the backbone's training distribution — validate per model.
 - SelfLift-rich (the distilled lifter + On-Policy Self Recovery) requires training and is not included.

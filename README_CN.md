@@ -75,7 +75,8 @@ H3 音视频实验性适配（论文未验证）。两种模式：
 
 ## 注意事项与限制
 
-- 只接受 `s_churn=0` 的标准 Euler；不支持 `noise_mask`/局部重绘。
+- 只接受 `s_churn=0` 的标准 Euler。
+- 两个采样器都支持 `noise_mask`（Set Latent Noise Mask 语义：1 = 生成，0 = 保留原内容；需要有初始化 latent 才有可保留的内容）。任意分辨率的 mask 都会缩放到 latent 网格，时间长度为 1 时全帧共享。保留区域在每一步都被钉到原始 latent，artifact-aware 修正也只作用于生成区域。`noise_mask` 与 `highres_tiling` 不兼容。
 - 必须使用采样模型所属的 VAE，保证像素锚点处于同一 latent 空间。
 - H3 的 768 像素短边在 `lowres_scale=0.5` 时为 384 像素，可能超出骨干训练分布——请按模型自行验证。
 - SelfLift-rich（蒸馏提升器 + On-Policy Self Recovery）需要训练，不在本插件内。
