@@ -139,8 +139,9 @@ def _forward_wrapper(state, executor, x, timestep, context, transformer_options,
         state["warned_inactive"] = True
     state["calls_this_forward"] = 0
     state["guard_misses"] = 0
-    # diagnostics off leaves fw_tst_time unreported; drop it per forward instead of leaking floats
+    # diagnostics off leaves fw_tst_time/fw_events unreported; drop them per forward instead of leaking
     state["fw_tst_time"].clear()
+    state["fw_events"].clear()
     video = x[0] if isinstance(x, (list, tuple)) else x
     if isinstance(video, torch.Tensor) and video.ndim == 5:
         state["frames"] = int(video.shape[2])
