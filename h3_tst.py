@@ -13,8 +13,14 @@ Anchored to ComfyUI sources:
 - video segment last: comfy/ldm/minimax/model.py PackedLayout ("target audio
   then target video, always the last two segments")
 - injection point: comfy/ldm/modules/attention.py wrap_attn, which checks
-  transformer_options["optimized_attention_override"] in every backend
+  transformer_options["optimized_attention_override"] in every backend (and
+  take()s AttentionTensorContainers before calling the override)
 - per-forward video shape: WrappersMP.DIFFUSION_MODEL wraps MiniMaxH3Model._forward
+
+Known limitation: not compatible with SelfLift highres_tiling. Wrappers run in
+registration order, so the TST wrapper sits outside the tiling wrapper and only
+sees the full-resolution shape; tile attention calls fail the length guard and
+TST skips with a warning instead of mislocating the tile's video rows.
 """
 
 import logging
@@ -28,6 +34,9 @@ from comfy.ldm.modules.attention import AttentionTensorContainer
 
 
 def _unwrap(tensor):
+    # H3 wraps q/k/v in AttentionTensorContainer, but wrap_attn take()s them
+    # before calling this override (it has no container_function attribute),
+    # so plain tensors are the common case here.
     return tensor.peek() if isinstance(tensor, AttentionTensorContainer) else tensor
 
 
@@ -54,15 +63,19 @@ def _spectral_tension(q, k, v0, frames, rows_per_frame, eps=1e-8):
 
 def _attention_override(state):
     def override(func, q, k, v, heads, mask=None, **kwargs):
-        state["calls_this_forward"] += 1
         frames = state["frames"]
         rows = state["rows_per_frame"]
         qt = _unwrap(q)
         s = qt.shape[2]
         # video rows are the last frames*rows of the packed sequence; the guard
-        # also rejects token-refiner calls (text length is far below frames*rows)
+        # also rejects token-refiner calls (text length is far below frames*rows).
+        # Only video attention calls advance the layer counter, so a refiner
+        # running inside a forward cannot shift the layer schedule.
         if frames is None or frames < 2 or s <= frames * rows:
+            if frames is not None and frames >= 2:
+                state["guard_misses"] += 1
             return func(q, k, v, heads, mask=mask, **kwargs)
+        state["calls_this_forward"] += 1
         layers = state["layers"]
         layer = (state["calls_this_forward"] - 1) % layers
         total_steps = state["total_steps"]
@@ -94,7 +107,16 @@ def _attention_override(state):
 def _forward_wrapper(state, executor, x, timestep, context, transformer_options, minimax_payload=None, **kwargs):
     if state["calls_this_forward"] > 0:
         state["layers"] = state["calls_this_forward"]
-        state["calls_this_forward"] = 0
+    elif state["guard_misses"] > 0 and not state["warned_inactive"]:
+        # every attention call of the previous forward was shorter than the
+        # registered video segment: the wrapper sits outside a spatial-tiling
+        # wrapper (wrappers run in registration order) and only saw the
+        # full-resolution shape, so TST cannot locate the tile's video rows
+        logging.warning("[H3 TST] inactive: packed sequence shorter than the expected video segment; "
+                        "TST is not compatible with highres_tiling and was skipped")
+        state["warned_inactive"] = True
+    state["calls_this_forward"] = 0
+    state["guard_misses"] = 0
     video = x[0] if isinstance(x, (list, tuple)) else x
     if isinstance(video, torch.Tensor) and video.ndim == 5:
         state["frames"] = int(video.shape[2])
@@ -113,6 +135,7 @@ def patch_model(model, tau, log_diagnostics=True):
     state = {"tau": float(tau), "log_diagnostics": bool(log_diagnostics),
              "frames": None, "rows_per_frame": None,
              "step": 0, "total_steps": 1, "layers": 50, "calls_this_forward": 0,
+             "guard_misses": 0, "warned_inactive": False,
              "fw_abs_tension": [], "fw_gamma": [], "fw_active": []}
     patched = model.clone()
     patched.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
