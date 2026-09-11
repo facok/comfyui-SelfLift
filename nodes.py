@@ -20,6 +20,7 @@ import torch
 
 import comfy.k_diffusion.sampling
 import comfy.model_management
+import comfy.model_patcher
 import comfy.model_sampling
 import comfy.nested_tensor
 import comfy.sample
@@ -112,14 +113,50 @@ def _validate_schedule(sigmas, transition_step):
 
 
 def _validate_latent_input(latent_image):
-    if latent_image.get("noise_mask") is not None:
-        raise ValueError("SelfLift: noise_mask/inpainting is not supported; use an empty latent without a mask")
+    """Validate the latent template; returns the normalized noise_mask or None.
+
+    Accepted mask shapes: [B, H, W], [B, 1, H, W], [B, 1, T, H, W] (1 = generate,
+    0 = keep the original content). Spatial dims must match the latent; a time
+    length of 1 shares the mask over all frames. Normalized to [B, 1, H, W] for
+    image latents and [B, 1, T|1, H, W] for video latents.
+    """
     streams, _ = _streams(latent_image["samples"])
     if not streams or streams[0].ndim not in (4, 5):
         raise ValueError("SelfLift: expected a 4D image or 5D video latent size template")
     for stream in streams:
         if stream.ndim == 0 or any(size == 0 for size in stream.shape) or stream.shape[0] != streams[0].shape[0]:
             raise ValueError("SelfLift: latent streams must be nonempty and have the same batch size")
+    mask = latent_image.get("noise_mask")
+    if mask is None:
+        return None
+    video = streams[0].ndim == 5
+    b, H, W = streams[0].shape[0], streams[0].shape[-2], streams[0].shape[-1]
+    if mask.ndim == 3:  # [B, H, W]
+        mask = mask[:, None]
+    if video and mask.ndim == 4:  # [B, 1, H, W] shared over time
+        mask = mask[:, :, None]
+    if mask.ndim != (5 if video else 4) or mask.shape[1] != 1:
+        raise ValueError("SelfLift: noise_mask must have shape [B, H, W], [B, 1, H, W], or [B, 1, T, H, W]")
+    if mask.shape[0] != b or tuple(mask.shape[-2:]) != (H, W):
+        raise ValueError(f"SelfLift: noise_mask shape {tuple(mask.shape)} does not match the latent batch/size ({b}, {H}, {W})")
+    if video and mask.shape[2] not in (1, streams[0].shape[2]):
+        raise ValueError(f"SelfLift: noise_mask time length {mask.shape[2]} does not match the latent frames {streams[0].shape[2]}")
+    if not torch.isfinite(mask).all():
+        raise ValueError("SelfLift: noise_mask must be finite")
+    return mask.float().clamp(0.0, 1.0)
+
+
+def _mask_blend_fn(anchor, mask):
+    """post-CFG hook pinning x0 to the clean anchor outside the generate region.
+
+    Exact under Euler: with the unmasked x0 pinned to the original latent each
+    step, the unmasked state tracks original + the step's noise exactly.
+    """
+    def fn(args):
+        d = args["denoised"]
+        m = mask.to(device=d.device, dtype=d.dtype)
+        return d * m + anchor.to(device=d.device, dtype=d.dtype) * (1.0 - m)
+    return fn
 
 
 def _euler_step(state, denoised, sigma, sigma_next):
@@ -180,7 +217,7 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
         raise ValueError("SelfLift: rho must be between 0 and 1")
     if not 0.0 <= w_min <= w_max <= 1.0:
         raise ValueError("SelfLift: weights must satisfy 0 <= w_min <= w_max <= 1")
-    _validate_latent_input(latent_image)
+    noise_mask = _validate_latent_input(latent_image)
 
     model_sampling = model.get_model_object("model_sampling")
     _validate_sampling(model_sampling, sampler)
@@ -200,16 +237,38 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     low_shape = (b, c, t, h, w) if video else (b, c, h, w)
     logging.info("[SelfLift plan] low_latent=%s target_latent=%s spatial_lift=(%.4f, %.4f) "
                  "low_nfe=%d high_nfe=%d sigma_prediction=%.8g sigma_resume=%.8g "
-                 "rho=%.4f weights=(%.4f, %.4f) direct_lift=%s pixel_anchor=%s cfg=%.4f",
+                 "rho=%.4f weights=(%.4f, %.4f) direct_lift=%s pixel_anchor=%s cfg=%.4f mask=%s",
                  low_shape, tuple(streams[0].shape), H / h, W / w,
                  transition_step, sigmas.numel() - 1 - transition_step,
                  sigmas[transition_step - 1].item(), sigmas[transition_step].item(),
                  rho, w_min, w_max,
                  "skipped" if rho == 1.0 and w_min == 1.0 else "external" if latent_lifter is not None else latent_upsample,
-                 rho > 0.0 and w_max > 0.0, cfg)
+                 rho > 0.0 and w_max > 0.0, cfg,
+                 "none" if noise_mask is None else f"{tuple(noise_mask.shape)}")
 
     device = comfy.model_management.intermediate_device()
     source_video = streams[0].to(device)
+    audio_streams = [s.to(device) for s in streams[1:]]
+
+    def masked_model(base, video_anchor, m):
+        # pin the unmasked region to the clean anchor via a post-CFG x0 blend;
+        # ComfyUI's denoise_mask path is unusable here: the high-res resume
+        # latent deliberately carries noise, which would contaminate its anchor
+        if m is None:
+            return base
+        patched = base.clone()
+        if nested:
+            flat_mask = m.reshape(b, 1, -1).repeat(1, 1, c).to(video_anchor.device)
+            flat_anchor = video_anchor.reshape(b, 1, -1)
+            for s in audio_streams:
+                flat_mask = torch.cat([flat_mask, torch.ones_like(s.reshape(b, 1, -1))], dim=-1)
+                flat_anchor = torch.cat([flat_anchor, s.reshape(b, 1, -1)], dim=-1)
+            hook = _mask_blend_fn(flat_anchor, flat_mask)
+        else:
+            hook = _mask_blend_fn(video_anchor, m)
+        patched.model_options = comfy.model_patcher.set_model_options_post_cfg_function(patched.model_options, hook)
+        return patched
+
     if video:
         low_video = torch.nn.functional.interpolate(
             source_video.float(), size=(t, h, w), mode="trilinear", align_corners=False
@@ -218,7 +277,25 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
         low_video = torch.nn.functional.interpolate(
             source_video.float(), size=(h, w), mode="bilinear", align_corners=False
         ).to(dtype=source_video.dtype)
-    low_latent = _pack([low_video] + [s.to(device) for s in streams[1:]], nested)
+    m_full = m_low = None
+    if noise_mask is not None:
+        if video and noise_mask.shape[2] == 1 and t > 1:
+            m_full = noise_mask.expand(b, 1, t, H, W)
+        else:
+            m_full = noise_mask
+        if video:
+            m_low = torch.nn.functional.interpolate(
+                m_full.reshape(b * t, 1, H, W).float(), size=(h, w), mode="bilinear", align_corners=False
+            ).reshape(b, 1, t, h, w)
+        else:
+            m_low = torch.nn.functional.interpolate(
+                m_full.float(), size=(h, w), mode="bilinear", align_corners=False)
+        m_low = m_low.clamp(0.0, 1.0)
+    low_anchor = low_video
+    video_anchor = source_video
+    low_latent = _pack([low_video] + audio_streams, nested)
+    low_model = masked_model(model, low_anchor, m_low)
+    high_model = masked_model(high_model, video_anchor, m_full)
     del source_video, low_video
     del streams
     noise_low = comfy.sample.prepare_noise(low_latent, seed, latent_image.get("batch_index", None))
@@ -267,10 +344,10 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     # update is discarded and rebuilt after the resolution transition, preserving NFE.
     resolution_scale = (getattr(model.get_model_object("latent_format"), "spacial_downscale_ratio", 1)
                         if video else getattr(model.get_model_object("latent_format"), "spacial_downscale_ratio", 1))
-    low_timer = _StageTimer("low_resolution", model.load_device, (h, w), resolution_scale)
-    log_memory("low_resolution start", model.load_device)
-    comfy.samplers.sample(model, noise_low, positive_low, negative_low, cfg, model.load_device,
-                          sampler, sigmas[:transition_step + 1], model.model_options,
+    low_timer = _StageTimer("low_resolution", low_model.load_device, (h, w), resolution_scale)
+    log_memory("low_resolution start", low_model.load_device)
+    comfy.samplers.sample(low_model, noise_low, positive_low, negative_low, cfg, low_model.load_device,
+                          sampler, sigmas[:transition_step + 1], low_model.model_options,
                           latent_image=low_latent, callback=callback_low,
                           disable_pbar=disable_pbar, seed=seed)
     if low_evaluations != transition_step:
@@ -300,7 +377,11 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     log_memory("transition lifts_ready", model.load_device)
     z_lat = latent_format.process_in(z_lat_vae) if z_lat_vae is not None else None
     z_pix = latent_format.process_in(z_pix_vae) if z_pix_vae is not None else None
-    z0_high = selflift.artifact_aware_consistency_lift(z_lat, z_pix, rho, w_min, w_max)
+    z0_high = selflift.artifact_aware_consistency_lift(z_lat, z_pix, rho, w_min, w_max, mask=m_full)
+    if m_full is not None:
+        # restore the keep-region with the true original instead of any lifted estimate
+        m_cast = m_full.to(device=z0_high.device, dtype=z0_high.dtype)
+        z0_high = z0_high * m_cast + video_anchor * (1.0 - m_cast)
     if os.environ.get("SELFLIFT_DEBUG", "0") == "1":
         _debug_dump(vae, {
             "z0_low": z0_low_vae,

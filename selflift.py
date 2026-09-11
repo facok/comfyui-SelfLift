@@ -99,20 +99,38 @@ def _pixel_anchor_video_single(z0_low, vae, out_hw):
     return vae.encode(up).float()  # the wrapper turns the frame batch back into the time dim
 
 
-def artifact_aware_consistency_lift(z_lat, z_pix, rho, w_min, w_max):
-    """Selective correction of the direct lift toward the pixel-VAE anchor (Eqs. 6-9)."""
+def artifact_aware_consistency_lift(z_lat, z_pix, rho, w_min, w_max, mask=None):
+    """Selective correction of the direct lift toward the pixel-VAE anchor (Eqs. 6-9).
+
+    mask: optional [B, 1, (T,) H, W] generate-region mask (1 = generate). Risk
+    statistics and the correction are restricted to mask > 0; masked-out
+    locations always keep the direct lift.
+    """
     if rho <= 0.0 or w_max <= 0.0:
         return z_lat
-    if rho >= 1.0 and w_min >= 1.0 and w_max >= 1.0:
+    if mask is None and rho >= 1.0 and w_min >= 1.0 and w_max >= 1.0:
         return z_pix
     delta = z_pix - z_lat
-    s = delta.abs().mean(dim=1)  # per-location inconsistency, [B, (T,) H, W]
-    view = (-1,) + (1,) * (s.ndim - 1)
-    flat = s.flatten(1)
-    thr = torch.quantile(flat, 1.0 - rho, dim=1).view(view)
-    mask = s >= thr
-    s_min = s.masked_fill(~mask, float("inf")).flatten(1).amin(dim=1).view(view)
-    s_max = s.masked_fill(~mask, float("-inf")).flatten(1).amax(dim=1).view(view)
+    if mask is not None:
+        s = delta.abs().mean(dim=1) * mask.squeeze(1)  # per-location inconsistency, [B, (T,) H, W]
+        region = (mask.squeeze(1) > 0).expand_as(s)
+        view = (-1,) + (1,) * (s.ndim - 1)
+        thr = torch.stack([
+            torch.quantile(s[b][region[b]], 1.0 - rho) if region[b].any()
+            else torch.full((), float("inf"), device=s.device, dtype=s.dtype)
+            for b in range(s.shape[0])
+        ]).view(view)
+        selected = (s >= thr) & region
+    else:
+        s = delta.abs().mean(dim=1)
+        view = (-1,) + (1,) * (s.ndim - 1)
+        flat = s.flatten(1)
+        thr = torch.quantile(flat, 1.0 - rho, dim=1).view(view)
+        selected = s >= thr
+    if not selected.any():
+        return z_lat
+    s_min = s.masked_fill(~selected, float("inf")).flatten(1).amin(dim=1).view(view)
+    s_max = s.masked_fill(~selected, float("-inf")).flatten(1).amax(dim=1).view(view)
     w = w_min + (w_max - w_min) * (s - s_min) / (s_max - s_min + 1e-8)
-    w = torch.where(mask, w, torch.zeros_like(w)).unsqueeze(1)
+    w = torch.where(selected, w, torch.zeros_like(w)).unsqueeze(1)
     return z_lat + w * delta
