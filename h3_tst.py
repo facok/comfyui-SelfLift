@@ -37,7 +37,8 @@ def _spectral_tension(q, k, v0, frames, rows_per_frame, eps=1e-8):
     q, k: [1, heads, S, head_dim] post-norm post-RoPE; video rows start at v0.
     Returns [heads] fp32; T>0 over-mixing, T<0 fragmented (paper Eqs. 1-3).
     """
-    heads, _, _, head_dim = q.shape
+    heads = q.shape[1]
+    head_dim = q.shape[-1]
     qv = q[0, :, v0:].reshape(heads, frames, rows_per_frame, head_dim).mean(dim=2).float()
     kv = k[0, :, v0:].reshape(heads, frames, rows_per_frame, head_dim).mean(dim=2).float()
     a = (qv @ kv.transpose(-2, -1) * head_dim**-0.5).softmax(dim=-1).clamp(min=eps)
