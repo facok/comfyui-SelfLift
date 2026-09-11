@@ -137,8 +137,15 @@ def _validate_latent_input(latent_image):
         mask = mask[:, :, None]
     if mask.ndim != (5 if video else 4) or mask.shape[1] != 1:
         raise ValueError("SelfLift: noise_mask must have shape [B, H, W], [B, 1, H, W], or [B, 1, T, H, W]")
-    if mask.shape[0] != b or tuple(mask.shape[-2:]) != (H, W):
-        raise ValueError(f"SelfLift: noise_mask shape {tuple(mask.shape)} does not match the latent batch/size ({b}, {H}, {W})")
+    if mask.shape[0] != b:
+        raise ValueError(f"SelfLift: noise_mask batch {mask.shape[0]} does not match the latent batch {b}")
+    if tuple(mask.shape[-2:]) != (H, W):
+        # masks are accepted at any resolution and resized to the latent grid,
+        # matching ComfyUI's Set Latent Noise Mask convention
+        lead = mask.shape[:-2]
+        mask = torch.nn.functional.interpolate(
+            mask.reshape(-1, 1, *mask.shape[-2:]).float(), size=(H, W), mode="bilinear", align_corners=False
+        ).reshape(*lead, H, W)
     if video and mask.shape[2] not in (1, streams[0].shape[2]):
         raise ValueError(f"SelfLift: noise_mask time length {mask.shape[2]} does not match the latent frames {streams[0].shape[2]}")
     if not torch.isfinite(mask).all():
