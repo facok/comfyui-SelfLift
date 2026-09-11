@@ -58,7 +58,7 @@ H3 节点的 `highres_tiling`（高分辨率分块）开关默认关闭。开启
 
 [TST](https://github.com/lytang63/temporal-state-transport) 到 MiniMax H3 的实验性移植。原论文只在 Wan2.2 上验证，未验证 H3；本节点是工程适配，不是经过验证的配置。TST 不盲目加强时间注意力，而是先做诊断：碎片化传输（注意力质量集中在过少帧上）会让细节漂移，过度混合（质量过于均匀地摊开）会破坏运动物理。
 
-H3 没有独立的时间注意力——它是在 `[text | cond/refs | audio | video]` 打包序列上的单流 transformer——因此节点对 video 段（永远是最后一个打包段）的 post-RoPE query/key 做帧内空间均值池化，逐头构造帧级传输算子 `A`（F×F），计算谱张力 `T = H_row - H_vN`（论文式 1–3），并只对 video 行的 query 施加稳态温度 `γ = exp(τ_eff · T)`（论文式 5–6）。张力为正则锐化，为负则软化。`τ_eff` 沿用论文余弦调度：更深的层和更早的去噪步校正更强。text、audio、reference 行从不被缩放。干预通过 ComfyUI 的 `optimized_attention_override` 钩子实现，与注意力后端无关（sage/flash/SDPA/kitchen 均可），每次调用只增加可忽略的 F×F 统计开销。
+H3 没有独立的时间注意力——它是在 `[text | cond/refs | audio | video]` 打包序列上的单流 transformer——因此节点对 video 段（永远是最后一个打包段）的 post-RoPE query/key 做帧内空间均值池化，逐头构造帧级传输算子 `A`（F×F），计算谱张力 `T = H_row - H_vN`（论文式 1–3），并只对 video 行的 query 施加稳态温度 `γ = exp(τ_eff · T)`（论文式 5–6）。张力为正则锐化，为负则软化。`τ_eff` 沿用论文余弦调度：更深的层和更早的去噪步校正更强。text、audio、reference 行从不被缩放。干预通过 ComfyUI 的 `optimized_attention_override` 钩子实现，与注意力后端无关（sage/flash/SDPA/kitchen 均可）。整个流程零训练、零权重改动、无可学习参数；额外开销只是每次注意力调用上的几个 F×F 小矩阵运算（实测每次模型前向 0.1–0.3 秒，约占采样时间 1–2%）。
 
 - `tau`：校正强度，论文默认 `0.2`；`0` 关闭校正但保留诊断。
 - `log_diagnostics`：每次模型前向输出一行 `[H3 TST]` 日志，包含步号、latent 帧数、每帧网格行数、平均张力绝对值 `|T|`、平均 `γ`、以及 `|γ-1| > 0.03` 的头比例。逐头张力在每次调用自身校正之前测量；跨步的变化反映之前调用和之前步的校正效果。
