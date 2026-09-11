@@ -77,7 +77,15 @@ def _attention_override(state):
                 state["guard_misses"] += 1
             return func(q, k, v, heads, mask=mask, **kwargs)
         state["calls_this_forward"] += 1
-        tst_start = time.perf_counter()
+        # GPU time via events: host-side perf_counter would absorb the sync stall
+        # from the float() conversions below (they wait on the whole GPU queue,
+        # not just TST's kernels) and report the forward's runtime as TST's
+        timed = state["log_diagnostics"]
+        if timed and qt.is_cuda:
+            tst_start, tst_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            tst_start.record()
+        elif timed:
+            tst_start = time.perf_counter()
         layers = state["layers"]
         layer = (state["calls_this_forward"] - 1) % layers
         total_steps = state["total_steps"]
@@ -88,23 +96,32 @@ def _attention_override(state):
         gamma = torch.exp(tension * (state["tau"] * layer_weight * step_weight))
         if state["tau"] != 0.0:
             qt[0, :, s - frames * rows:].mul_(gamma.to(qt.dtype)[:, None, None])
-        state["fw_tst_time"].append(time.perf_counter() - tst_start)
         if state["log_diagnostics"]:
+            if qt.is_cuda:
+                tst_end.record()
+                state["fw_events"].append((tst_start, tst_end))
+            else:
+                state["fw_tst_time"].append(time.perf_counter() - tst_start)
             state["fw_abs_tension"].append(float(tension.abs().mean()))
             state["fw_gamma"].append(float(gamma.mean()))
             state["fw_active"].append(float(((gamma - 1.0).abs() > 0.03).float().mean()))
             if layer == layers - 1 and state["fw_gamma"]:
+                tst_ms = 1000.0 * sum(state["fw_tst_time"])
+                for ev_start, ev_end in state["fw_events"]:
+                    ev_end.synchronize()
+                    tst_ms += ev_start.elapsed_time(ev_end)
                 logging.info(
-                    "[H3 TST] step %d/%d frames=%d grid_rows=%d mean|T|=%.4f mean_gamma=%.4f active_heads=%.0f%% tst_time=%.1fms",
+                    "[H3 TST] step %d/%d frames=%d grid_rows=%d mean|T|=%.4f mean_gamma=%.4f active_heads=%.0f%% tst_time=%.2fs",
                     state["step"], total_steps, frames, rows,
                     sum(state["fw_abs_tension"]) / len(state["fw_abs_tension"]),
                     sum(state["fw_gamma"]) / len(state["fw_gamma"]),
                     100.0 * sum(state["fw_active"]) / len(state["fw_active"]),
-                    1000.0 * sum(state["fw_tst_time"]))
+                    tst_ms / 1000.0)
                 state["fw_abs_tension"].clear()
                 state["fw_gamma"].clear()
                 state["fw_active"].clear()
                 state["fw_tst_time"].clear()
+                state["fw_events"].clear()
         return func(q, k, v, heads, mask=mask, **kwargs)
     return override
 
@@ -143,7 +160,7 @@ def patch_model(model, tau, log_diagnostics=True):
              "frames": None, "rows_per_frame": None,
              "step": 0, "total_steps": 1, "layers": 50, "calls_this_forward": 0,
              "guard_misses": 0, "warned_inactive": False,
-             "fw_abs_tension": [], "fw_gamma": [], "fw_active": [], "fw_tst_time": []}
+             "fw_abs_tension": [], "fw_gamma": [], "fw_active": [], "fw_tst_time": [], "fw_events": []}
     patched = model.clone()
     patched.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
                                  "selflift_h3_tst", partial(_forward_wrapper, state))
