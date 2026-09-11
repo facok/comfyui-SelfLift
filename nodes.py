@@ -225,6 +225,8 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     if not 0.0 <= w_min <= w_max <= 1.0:
         raise ValueError("SelfLift: weights must satisfy 0 <= w_min <= w_max <= 1")
     noise_mask = _validate_latent_input(latent_image)
+    if highres_tiling and noise_mask is not None:
+        raise ValueError("SelfLift: noise_mask is not compatible with highres_tiling")
 
     model_sampling = model.get_model_object("model_sampling")
     _validate_sampling(model_sampling, sampler)
