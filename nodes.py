@@ -192,11 +192,16 @@ def _resize_keyframes(cond, h, w):
                         lat.float().permute(0, 2, 1, 3, 4).reshape(batch * frames, channels, lat.shape[-2], lat.shape[-1]),
                         size=(h, w), mode="bilinear", align_corners=False
                     )
-                    kf["latent"] = resized_latent.reshape(batch, frames, channels, h, w).permute(0, 2, 1, 3, 4).to(lat)
+                    resized_latent = resized_latent.reshape(batch, frames, channels, h, w).permute(0, 2, 1, 3, 4)
                 else:
-                    kf["latent"] = torch.nn.functional.interpolate(
+                    resized_latent = torch.nn.functional.interpolate(
                         lat.float(), size=(h, w), mode="bilinear", align_corners=False
-                    ).to(lat)
+                    )
+                # per-channel, per-frame mean match: fixes bilinear's color drift without
+                # restoring variance the low-res grid cannot represent
+                source_mean = lat.float().mean(dim=(-2, -1), keepdim=True)
+                resized_mean = resized_latent.mean(dim=(-2, -1), keepdim=True)
+                kf["latent"] = (resized_latent + (source_mean - resized_mean)).to(lat)
             resized.append(kf)
         d["minimax_keyframes"] = resized
         out.append((tensor, d))
