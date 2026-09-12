@@ -481,6 +481,11 @@ class SelfLiftH3Sampler:
 
     def sample(self, model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
                transition_step, lowres_scale, rho, w_min, w_max, upscaler_model, model_hires=None, highres_tiling=False):
+        if rho == 0.0 and upscaler_model == "none":
+            raise ValueError(
+                "SelfLift H3: rho=0 with upscaler_model=none disables both SelfLift-zero correction "
+                "and external latent upscaling; choose rho>0 or select an external H3 upscaler."
+            )
         lifter = None
         if upscaler_model != "none":
             if rho > 0.0 and w_max > 0.0:
