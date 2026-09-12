@@ -185,9 +185,27 @@ def _resize_keyframes(cond, h, w):
             kf = dict(kf)
             lat = kf.get("latent")
             if lat is not None and (lat.shape[-2] != h or lat.shape[-1] != w):
-                kf["latent"] = torch.nn.functional.interpolate(
-                    lat.float(), size=(lat.shape[2], h, w), mode="nearest"
-                ).to(lat)
+                if lat.ndim == 5:
+                    batch, channels, frames = lat.shape[:3]
+                    resized_latent = torch.nn.functional.interpolate(
+                        lat.float().permute(0, 2, 1, 3, 4).reshape(batch * frames, channels, lat.shape[-2], lat.shape[-1]),
+                        size=(h, w), mode="bilinear", align_corners=False
+                    )
+                    resized_latent = resized_latent.reshape(batch, frames, channels, h, w).permute(0, 2, 1, 3, 4)
+                    reduce_dims = (0, 2, 3, 4)
+                else:
+                    resized_latent = torch.nn.functional.interpolate(
+                        lat.float(), size=(h, w), mode="bilinear", align_corners=False
+                    )
+                    reduce_dims = (0, 2, 3)
+                source_mean = lat.float().mean(dim=reduce_dims, keepdim=True)
+                source_std = lat.float().std(dim=reduce_dims, keepdim=True, unbiased=False)
+                resized_mean = resized_latent.mean(dim=reduce_dims, keepdim=True)
+                resized_std = resized_latent.std(dim=reduce_dims, keepdim=True, unbiased=False)
+                std_ratio = (source_std / resized_std.clamp_min(1e-6)).clamp(0.75, 1.25)
+                corrected = (resized_latent - resized_mean) * std_ratio + source_mean
+                resized_latent = resized_latent + 0.6 * (corrected - resized_latent)
+                kf["latent"] = resized_latent.to(lat)
             resized.append(kf)
         d["minimax_keyframes"] = resized
         out.append((tensor, d))
