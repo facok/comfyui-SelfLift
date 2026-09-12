@@ -186,7 +186,7 @@ def _resize_keyframes(cond, h, w):
             lat = kf.get("latent")
             if lat is not None and (lat.shape[-2] != h or lat.shape[-1] != w):
                 kf["latent"] = torch.nn.functional.interpolate(
-                    lat.float(), size=(lat.shape[2], h, w), mode="trilinear", align_corners=False
+                    lat.float(), size=(lat.shape[2], h, w), mode="nearest"
                 ).to(lat)
             resized.append(kf)
         d["minimax_keyframes"] = resized
