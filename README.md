@@ -17,6 +17,7 @@ The paper's SelfLift-zero for rectified-flow image backbones. Connect 4D image l
 | `rho` | 0.3 | Fraction of high-risk locations corrected toward the pixel-VAE anchor. FLUX.2-Klein: 0.4. 0 disables the anchor |
 | `w_min` / `w_max` | 0.5 / 1.0 | Correction strength range inside the selected locations |
 | `latent_upsample` | nearest | Direct-lift interpolation; `bilinear` is an option |
+| `model_hires` (optional) | — | Separate model for the high-resolution stage (e.g. a different checkpoint or LoRA stack). Must share the same architecture and latent format; the low-res prefix always runs on `model` |
 
 The transition adds no denoiser evaluations: an N-step schedule stays exactly N NFEs, plus one VAE decode → upscale → re-encode round trip unless `rho=0`.
 

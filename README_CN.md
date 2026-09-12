@@ -17,6 +17,7 @@ ComfyUI 渐进分辨率采样：前期去噪步骤跑低分辨率，把结果提
 | `rho` | 0.3 | 向像素 VAE 锚点修正的高风险位置比例。FLUX.2-Klein 取 0.4；0 关闭锚点 |
 | `w_min` / `w_max` | 0.5 / 1.0 | 选中位置的修正强度范围 |
 | `latent_upsample` | nearest | 直接提升插值；可选 `bilinear` |
+| `model_hires`（可选） | — | 高分辨率阶段使用的另一个模型（如不同 checkpoint 或 LoRA 组合）。必须与 `model` 同架构、同 latent 格式；低分辨率前缀始终用 `model` |
 
 过渡不增加去噪评估次数：N 步调度仍严格等于 N 次 NFE；`rho=0` 以外的情况多一次 VAE 解码 → 上采样 → 重编码往返。
 
