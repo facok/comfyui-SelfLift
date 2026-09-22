@@ -28,7 +28,7 @@ H3 音视频实验性适配（论文未验证）。两种模式：
 - **外部 upscaler（默认）**：安装 H3 checkpoint 且 `rho=0`——学习式纯 latent 提升。实用默认，但不是 SelfLift-zero。
 - **SelfLift-zero**:`upscaler_model=none` 且 `rho>0`。H3 建议起点：`rho=0.6`、`w_min=w_max=1`（见"诊断 H3")。
 
-额外输入：`upscaler_model`、`upscaler_unload`（默认开启：放大完立即把 upscaler 从显存卸载，再进入高分辨率阶段）与 `highres_tiling`（实验性：把高分辨率阶段切成 1–8 个空间块以省显存；只保留首块音频，块间无全局注意力，不支持 ControlNet，画质和速度可能变化）。
+额外输入：`upscaler_model`、`upscaler_unload`（默认开启：放大完立即把 upscaler 从显存卸载，再进入高分辨率阶段）、`highres_tiling`（实验性：把高分辨率阶段切成空间块以省显存；只保留首块音频，块间无全局注意力，不支持 ControlNet，画质和速度可能变化）、`highres_tile_count`（`auto`/`1–8` 下拉菜单，仅在开启 `highres_tiling` 时显示并生效；`auto` 沿用按显存自动选择 1–8 块的逻辑，`1–8` 指定分块数量）与 `highres_tile_axis`（`auto`/`height`/`width`；`auto` 选择较长的 latent 空间轴，`height` 产生横向条带，`width` 产生纵向条带）。
 
 ### 可选 H3 upscaler
 

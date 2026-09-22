@@ -30,6 +30,16 @@ def _regions(length, tile_count=2):
     return regions
 
 
+def _tile_axis(video_shape, requested_axis="auto"):
+    if requested_axis == "auto":
+        return 3 if (video_shape[3] + 1) // 2 >= (video_shape[4] + 1) // 2 else 4
+    if requested_axis == "height":
+        return 3
+    if requested_axis == "width":
+        return 4
+    raise ValueError("SelfLift: high-resolution tiling axis must be auto, height, or width")
+
+
 def _packed_layout(signature, payload):
     options = {"keyframes": payload.get("keyframes"), "refs": payload.get("refs")}
     if "frame_count" in inspect.signature(PackedLayout).parameters:
@@ -74,7 +84,7 @@ def _tile_payload(payload, context, video, audio, axis, start, end):
 def _tiled_forward(executor, streams, timestep, context, transformer_options, minimax_payload=None,
                    n_tiles=2, plan=None, **kwargs):
     video, audio = streams
-    axis = 3 if (video.shape[3] + 1) // 2 >= (video.shape[4] + 1) // 2 else 4
+    axis = plan['axis'] if plan is not None else _tile_axis(video.shape)
     length = video.shape[axis]
     regions = _regions(length, plan['tiles'] if plan is not None else n_tiles)
     if len(regions) == 1:
@@ -148,24 +158,37 @@ def _budget(model, noise_shape, conds, latent_shapes, regions, axis):
 
 
 def _prepare_tiled_sampling(executor, model, noise_shape, conds, model_options=None,
-                            force_full_load=False, force_offload=False, *, latent_shapes, plan=None):
+                             force_full_load=False, force_offload=False, *, latent_shapes, plan=None):
     video_shape, audio_shape = latent_shapes
-    axis = 3 if (video_shape[3] + 1) // 2 >= (video_shape[4] + 1) // 2 else 4
+    axis = plan['axis'] if plan is not None else _tile_axis(video_shape)
     full_elements = math.prod(video_shape[1:]) + math.prod(audio_shape[1:])
     if tuple(noise_shape) != (video_shape[0], 1, full_elements):
         raise ValueError("SelfLift: tiled memory planning received a different latent shape than the sampling input")
     count = 2
     if plan is not None:
-        available = _available_workspace(model)
-        for count in range(1, 9):
-            regions = _regions(video_shape[axis], count)
-            _, _, _, _, minimum = _budget(model, noise_shape, conds, latent_shapes, regions, axis)
-            if minimum <= available:
-                break
-        count = len(regions)
+        requested = plan.get('requested_tiles', 0)
+        if requested > 0:
+            regions = _regions(video_shape[axis], requested)
+            count = len(regions)
+            if count != requested:
+                maximum = max(1, ((video_shape[axis] + 1) // 2) // 2)
+                raise ValueError(
+                    f"SelfLift: requested {requested} high-resolution tiles, but the selected "
+                    f"latent axis supports at most {maximum}"
+                )
+            logging.info("[SelfLift tiling plan] axis=%s tiles=%d mode=manual",
+                         'H' if axis == 3 else 'W', count)
+        else:
+            available = _available_workspace(model)
+            for count in range(1, 9):
+                regions = _regions(video_shape[axis], count)
+                _, _, _, _, minimum = _budget(model, noise_shape, conds, latent_shapes, regions, axis)
+                if minimum <= available:
+                    break
+            count = len(regions)
+            logging.info("[SelfLift tiling plan] axis=%s tiles=%d target=%.2f MiB estimate_fits=%s",
+                         'H' if axis == 3 else 'W', count, available / 2**20, minimum <= available)
         plan['tiles'] = count
-        logging.info("[SelfLift tiling plan] axis=%s tiles=%d target=%.2f MiB estimate_fits=%s",
-                     'H' if axis == 3 else 'W', plan['tiles'], available / 2**20, minimum <= available)
     regions = _regions(video_shape[axis], count)
     if len(regions) == 1 or force_offload:
         return executor(model, noise_shape, conds, model_options=model_options,
@@ -203,12 +226,17 @@ def _available_workspace(model):
     return available
 
 
-def tiled_model(model, latent_shapes):
+def tiled_model(model, latent_shapes, tile_count=0, tile_axis="auto"):
     if not isinstance(model.model, comfy.model_base.MiniMaxH3):
         raise ValueError("SelfLift: high-resolution tiling requires a MiniMax H3 model")
     if len(latent_shapes) != 2 or len(latent_shapes[0]) != 5 or len(latent_shapes[1]) != 4:
         raise ValueError("SelfLift: high-resolution tiling requires H3 video and audio latent streams")
-    plan = {}
+    if not isinstance(tile_count, int) or not 0 <= tile_count <= 8:
+        raise ValueError("SelfLift: high-resolution tile count must be an integer between 0 and 8")
+    plan = {
+        'requested_tiles': tile_count,
+        'axis': _tile_axis(latent_shapes[0], tile_axis),
+    }
     patched = model.clone()
     patched.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
                                  "selflift_high_resolution_tiling", partial(_tiled_forward, plan=plan))
