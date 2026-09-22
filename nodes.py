@@ -226,9 +226,31 @@ def _debug_dump(vae, latents):
         Image.fromarray(frame).save(os.path.join(out_dir, name + ".png"))
 
 
+def _normalize_highres_tile_count(highres_tiling, value):
+    """Convert the dropdown value to the integer used by the tiling backend."""
+    if not highres_tiling:
+        return 0
+    if value == "auto":
+        return 0
+    if isinstance(value, int) and 0 <= value <= 8:
+        return value
+    if isinstance(value, str) and value in {str(count) for count in range(1, 9)}:
+        return int(value)
+    raise ValueError("SelfLift: high-resolution tile count must be auto or an integer from 1 to 8")
+
+
+def _normalize_highres_tile_axis(highres_tiling, value):
+    if not highres_tiling:
+        return "auto"
+    if value in {"auto", "height", "width"}:
+        return value
+    raise ValueError("SelfLift: high-resolution tiling axis must be auto, height, or width")
+
+
 def progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
                        transition_step, lowres_scale, rho, w_min, w_max, latent_upsample, latent_lifter=None,
-                       highres_tiling=False, model_hires=None):
+                       highres_tiling=False, model_hires=None, highres_tile_count="auto",
+                       highres_tile_axis="auto"):
     _validate_schedule(sigmas, transition_step)
     if sigmas.numel() < 2:
         return latent_image
@@ -241,6 +263,8 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     noise_mask = _validate_latent_input(latent_image)
     if highres_tiling and noise_mask is not None:
         raise ValueError("SelfLift: noise_mask is not compatible with highres_tiling")
+    highres_tile_count = _normalize_highres_tile_count(highres_tiling, highres_tile_count)
+    highres_tile_axis = _normalize_highres_tile_axis(highres_tiling, highres_tile_axis)
 
     model_sampling = model.get_model_object("model_sampling")
     _validate_sampling(model_sampling, sampler)
@@ -249,7 +273,9 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
         model, latent_image["samples"], latent_image.get("downscale_ratio_spacial", None),
         latent_image.get("downscale_ratio_temporal", None)))
     hires_base = model_hires if model_hires is not None else model
-    high_model = h3_tiling.tiled_model(hires_base, [tuple(stream.shape) for stream in streams]) if highres_tiling else hires_base
+    high_model = h3_tiling.tiled_model(
+        hires_base, [tuple(stream.shape) for stream in streams], highres_tile_count, highres_tile_axis
+    ) if highres_tiling else hires_base
     video = streams[0].ndim == 5
     if video:
         b, c, t, H, W = streams[0].shape
@@ -448,7 +474,10 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
 
     high_timer = _StageTimer("high_resolution", model.load_device, (H, W), resolution_scale)
     if highres_tiling:
-        logging.info("[SelfLift plan] automatic high-resolution tiling enabled; preparation selects the tile count")
+        if highres_tile_count == 0:
+            logging.info("[SelfLift plan] automatic high-resolution tiling enabled; preparation selects the tile count")
+        else:
+            logging.info("[SelfLift plan] high-resolution tiling enabled with %d requested tiles", highres_tile_count)
     out = comfy.samplers.sample(high_model, resume_noise, positive, negative, cfg, model.load_device,
                                 sampler, sigmas[transition_step:], high_model.model_options,
                                 latent_image=resume_latent, callback=callback_high,
@@ -486,8 +515,10 @@ class SelfLiftH3Sampler:
             "upscaler_model": _upscaler_input(),
         }, "optional": {
             "model_hires": ("MODEL", {"tooltip": "Optional: model used for the high-resolution stage instead of `model` (e.g. a different checkpoint or LoRA stack). Must share the same architecture and latent format. The low-resolution prefix always runs on `model`."}),
-            "highres_tiling": ("BOOLEAN", {"default": False, "label_on": "高分辨率分块：开启", "label_off": "高分辨率分块：关闭", "tooltip": "Experimental: select 1–8 spatial tiles from available memory at high-resolution preparation. Audio input and references remain complete; only the first tile's audio prediction is retained. Quality and speed may change."}),
+            "highres_tiling": ("BOOLEAN", {"default": False, "label_on": "高分辨率分块：开启", "label_off": "高分辨率分块：关闭", "tooltip": "Experimental spatial tiling for the high-resolution stage. The auto tile count selects 1–8 tiles from available memory. Audio input and references remain complete; only the first tile's audio prediction is retained. Quality and speed may change."}),
             "upscaler_unload": ("BOOLEAN", {"default": True, "label_on": "放大后卸载：开启", "label_off": "放大后卸载：关闭", "tooltip": "Unload the external H3 upscaler from VRAM right after the lift, before the high-resolution stage loads. Disable only if the upscaler is reused between runs and VRAM is not tight."}),
+            "highres_tile_count": (["auto", *[str(count) for count in range(1, 9)]], {"default": "auto", "tooltip": "Only shown and used when highres_tiling is enabled. auto keeps memory-based tile selection; 1–8 requests exactly that many spatial tiles."}),
+            "highres_tile_axis": (["auto", "height", "width"], {"default": "auto", "tooltip": "Only shown and used when highres_tiling is enabled. auto selects the longer latent axis; height creates horizontal strips, while width creates vertical strips."}),
         }}
 
     RETURN_TYPES = ("LATENT",)
@@ -496,7 +527,7 @@ class SelfLiftH3Sampler:
 
     def sample(self, model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
                transition_step, lowres_scale, rho, w_min, w_max, upscaler_model, model_hires=None, highres_tiling=False,
-               upscaler_unload=True):
+               upscaler_unload=True, highres_tile_count="auto", highres_tile_axis="auto"):
         if rho == 0.0 and upscaler_model == "none":
             raise ValueError(
                 "SelfLift H3: rho=0 with upscaler_model=none disables both SelfLift-zero correction "
@@ -509,7 +540,9 @@ class SelfLiftH3Sampler:
             lifter = lambda z, hw: h3_upscaler.learned_latent_lift(z, hw, upscaler_model, force_unload=upscaler_unload)
         return (progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
                                    transition_step, lowres_scale, rho, w_min, w_max, "nearest",
-                                   latent_lifter=lifter, highres_tiling=highres_tiling, model_hires=model_hires),)
+                                   latent_lifter=lifter, highres_tiling=highres_tiling,
+                                   highres_tile_count=highres_tile_count, highres_tile_axis=highres_tile_axis,
+                                   model_hires=model_hires),)
 
 
 class SelfLiftImageSampler:
