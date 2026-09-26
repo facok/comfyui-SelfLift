@@ -48,15 +48,20 @@ def _tile_payload(payload, context, video, audio, axis, start, end):
     if payload.get("keyframes"):
         keyframes = []
         for keyframe in payload["keyframes"]:
-            latent = keyframe["latent"]
+            latent = keyframe.get("latent")
+            if latent is None:
+                keyframes.append(keyframe)
+                continue
             if latent.shape[-2:] != (height, width):
                 raise ValueError("SelfLift: tiled H3 keyframes must match the target latent height and width")
             region = latent.narrow(axis, start, end - start)
             keyframes.append({**keyframe, "latent": comfy.ldm.common_dit.pad_to_patch_size(
                 region, (1, 2, 2)).contiguous()})
         tiled["keyframes"] = keyframes
-        if not payload.get("refs"):
-            tiled["cond_video_latents"] = [keyframe["latent"] for keyframe in keyframes]
+        # cond rows keep the payload's order: the tile's keyframes, then the untiled references
+        tiled["cond_video_latents"] = [keyframe["latent"] for keyframe in keyframes if keyframe.get("latent") is not None]
+        tiled["cond_video_latents"] += [reference["latent"] for reference in payload.get("refs") or []
+                                       if "latent" in reference]
     tile_height = end - start if axis == 3 else height
     tile_width = end - start if axis == 4 else width
     layout = _packed_layout((context.shape[1], video.shape[2], (tile_height + 1) // 2 * 2,
